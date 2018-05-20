@@ -446,7 +446,7 @@ std::shared_ptr<CappedInsertNotifier> PlanExecutor::getCappedInsertNotifier() {
     // We can only wait if we have a collection; otherwise we should retry immediately when
     // we hit EOF.
     dassert(_opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IS));
-    auto db = dbHolder().get(_opCtx, _nss.db());
+    auto db = DatabaseHolder::getDatabaseHolder().get(_opCtx, _nss.db());
     invariant(db);
     auto collection = db->getCollection(_opCtx, _nss);
     invariant(collection);
@@ -488,7 +488,7 @@ PlanExecutor::ExecState PlanExecutor::waitForInserts(CappedInsertNotifierData* n
 
 PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, RecordId* dlOut) {
     if (MONGO_FAIL_POINT(planExecutorAlwaysFails)) {
-        Status status(ErrorCodes::OperationFailed,
+        Status status(ErrorCodes::InternalError,
                       str::stream() << "PlanExecutor hit planExecutorAlwaysFails fail point");
         *objOut =
             Snapshotted<BSONObj>(SnapshotId(), WorkingSetCommon::buildMemberStatusObject(status));
@@ -628,6 +628,7 @@ PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, 
 
             if (NULL != objOut) {
                 BSONObj statusObj;
+                invariant(WorkingSet::INVALID_ID != id);
                 WorkingSetCommon::getStatusMemberObject(*_workingSet, id, &statusObj);
                 *objOut = Snapshotted<BSONObj>(SnapshotId(), statusObj);
             }

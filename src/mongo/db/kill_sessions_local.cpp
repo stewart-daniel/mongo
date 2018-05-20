@@ -37,28 +37,72 @@
 #include "mongo/db/kill_sessions_common.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-
-SessionKiller::Result killSessionsLocalKillCursors(OperationContext* opCtx,
-                                                   const SessionKiller::Matcher& matcher) {
+namespace {
+void killSessionsLocalKillCursors(OperationContext* opCtx, const SessionKiller::Matcher& matcher) {
 
     auto res = CursorManager::killCursorsWithMatchingSessions(opCtx, matcher);
-    auto status = res.first;
+    uassertStatusOK(res.first);
+}
+}  // namespace
 
-    if (status.isOK()) {
-        return std::vector<HostAndPort>{};
-    } else {
-        return status;
-    }
+void killSessionsLocalKillTransactions(OperationContext* opCtx,
+                                       const SessionKiller::Matcher& matcher,
+                                       bool shouldKillClientCursors) {
+    SessionCatalog::get(opCtx)->scanSessions(
+        opCtx, matcher, [shouldKillClientCursors](OperationContext* opCtx, Session* session) {
+            session->abortArbitraryTransaction(opCtx, shouldKillClientCursors);
+        });
+}
+
+void killSessionsLocalKillTransactionCursors(OperationContext* opCtx,
+                                             const SessionKiller::Matcher& matcher) {
+    SessionCatalog::get(opCtx)->scanSessions(
+        opCtx, matcher, [](OperationContext* opCtx, Session* session) {
+            session->killTransactionCursors(opCtx);
+        });
 }
 
 SessionKiller::Result killSessionsLocal(OperationContext* opCtx,
                                         const SessionKiller::Matcher& matcher,
                                         SessionKiller::UniformRandomBitGenerator* urbg) {
-    uassertStatusOK(killSessionsLocalKillCursors(opCtx, matcher));
-    return uassertStatusOK(killSessionsLocalKillOps(opCtx, matcher));
+    killSessionsLocalKillTransactions(opCtx, matcher);
+    uassertStatusOK(killSessionsLocalKillOps(opCtx, matcher));
+    killSessionsLocalKillCursors(opCtx, matcher);
+    return {std::vector<HostAndPort>{}};
+}
+
+void killAllExpiredTransactions(OperationContext* opCtx) {
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    SessionCatalog::get(opCtx)->scanSessions(
+        opCtx, matcherAllSessions, [](OperationContext* opCtx, Session* session) {
+            try {
+                session->abortArbitraryTransactionIfExpired(opCtx);
+            } catch (const DBException& ex) {
+                Status status = ex.toStatus();
+                std::string errmsg = str::stream()
+                    << "May have failed to abort expired transaction with session id (lsid) '"
+                    << session->getSessionId() << "'."
+                    << " Caused by: " << status;
+
+                // LockTimeout errors are expected if we are unable to acquire an IS lock to clean
+                // up transaction cursors. The transaction abort (and lock resource release) should
+                // have succeeded despite failing to clean up cursors. The cursors will eventually
+                // be cleaned up by the cursor manager. We'll log such errors at a higher log level
+                // for diagnostic purposes in case something gets stuck.
+                if (ErrorCodes::isShutdownError(status.code()) ||
+                    status == ErrorCodes::LockTimeout) {
+                    LOG(1) << errmsg;
+                } else {
+                    warning() << errmsg;
+                }
+            }
+        });
 }
 
 }  // namespace mongo

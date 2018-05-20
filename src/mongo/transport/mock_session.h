@@ -66,13 +66,13 @@ public:
     }
 
     void end() override {
-        if (!_tl->owns(id()))
+        if (!_tl || !_tl->owns(id()))
             return;
         _tl->_sessions[id()].ended = true;
     }
 
     StatusWith<Message> sourceMessage() override {
-        if (_tl->inShutdown()) {
+        if (!_tl || _tl->inShutdown()) {
             return TransportLayer::ShutdownStatus;
         } else if (!_tl->owns(id())) {
             return TransportLayer::SessionUnknownStatus;
@@ -83,12 +83,12 @@ public:
         return Message();  // Subclasses can do something different.
     }
 
-    void asyncSourceMessage(std::function<void(StatusWith<Message>)> cb) override {
-        cb(sourceMessage());
+    Future<Message> asyncSourceMessage(const transport::BatonHandle& handle = nullptr) override {
+        return Future<Message>::makeReady(sourceMessage());
     }
 
     Status sinkMessage(Message message) override {
-        if (_tl->inShutdown()) {
+        if (!_tl || _tl->inShutdown()) {
             return TransportLayer::ShutdownStatus;
         } else if (!_tl->owns(id())) {
             return TransportLayer::SessionUnknownStatus;
@@ -99,8 +99,17 @@ public:
         return Status::OK();
     }
 
-    void asyncSinkMessage(Message message, std::function<void(Status)> cb) override {
-        cb(sinkMessage(message));
+    Future<void> asyncSinkMessage(Message message,
+                                  const transport::BatonHandle& handle = nullptr) override {
+        return Future<void>::makeReady(sinkMessage(message));
+    }
+
+    void cancelAsyncOperations(const transport::BatonHandle& handle = nullptr) override {}
+
+    void setTimeout(boost::optional<Milliseconds>) override {}
+
+    bool isConnected() override {
+        return true;
     }
 
     explicit MockSession(TransportLayer* tl)

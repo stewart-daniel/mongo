@@ -1,5 +1,4 @@
 /*    Copyright 2013 10gen Inc.
-
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -77,14 +76,6 @@ const User::SCRAMCredentials<SHA256Block>& User::CredentialData::scram<SHA256Blo
     return scram_sha256;
 }
 
-const UserName& User::getName() const {
-    return _name;
-}
-
-const SHA256Block& User::getDigest() const {
-    return _digest;
-}
-
 RoleNameIterator User::getRoles() const {
     return makeRoleNameIteratorForContainer(_roles);
 }
@@ -115,6 +106,11 @@ const ActionSet User::getActionsForResource(const ResourcePattern& resource) con
         return ActionSet();
     }
     return it->second.getActions();
+}
+
+
+bool User::hasActionsForResource(const ResourcePattern& resource) const {
+    return !getActionsForResource(resource).empty();
 }
 
 void User::setCredentials(const CredentialData& credentials) {

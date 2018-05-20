@@ -102,6 +102,8 @@ struct __wt_txn_global {
 	volatile uint64_t oldest_id;
 
 	WT_DECL_TIMESTAMP(commit_timestamp)
+	WT_DECL_TIMESTAMP(last_ckpt_timestamp)
+	WT_DECL_TIMESTAMP(meta_ckpt_timestamp)
 	WT_DECL_TIMESTAMP(oldest_timestamp)
 	WT_DECL_TIMESTAMP(pinned_timestamp)
 	WT_DECL_TIMESTAMP(recovery_timestamp)
@@ -172,6 +174,7 @@ typedef enum __wt_txn_isolation {
 struct __wt_txn_op {
 	uint32_t fileid;
 	enum {
+		WT_TXN_OP_NONE,
 		WT_TXN_OP_BASIC,
 		WT_TXN_OP_INMEM,
 		WT_TXN_OP_REF_DELETE,

@@ -59,7 +59,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
@@ -364,6 +364,9 @@ Config::Config(const string& _dbname, const BSONObj& cmdObj) {
  * Clean up the temporary and incremental collections
  */
 void State::dropTempCollections() {
+    // The cleanup handler should not be interruptible.
+    UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
+
     if (!_config.tempNamespace.isEmpty()) {
         writeConflictRetry(_opCtx, "M/R dropTempCollections", _config.tempNamespace.ns(), [this] {
             AutoGetDb autoDb(_opCtx, _config.tempNamespace.db(), MODE_X);
@@ -390,7 +393,8 @@ void State::dropTempCollections() {
 
         writeConflictRetry(_opCtx, "M/R dropTempCollections", _config.incLong.ns(), [this] {
             Lock::DBLock lk(_opCtx, _config.incLong.db(), MODE_X);
-            if (Database* db = dbHolder().get(_opCtx, _config.incLong.ns())) {
+            if (Database* db =
+                    DatabaseHolder::getDatabaseHolder().get(_opCtx, _config.incLong.ns())) {
                 WriteUnitOfWork wunit(_opCtx);
                 uassertStatusOK(db->dropCollection(_opCtx, _config.incLong.ns()));
                 wunit.commit();
@@ -423,10 +427,10 @@ void State::prepTempCollection() {
             CollectionOptions options;
             options.setNoIdIndex();
             options.temp = true;
-            if (enableCollectionUUIDs) {
-                options.uuid.emplace(UUID::gen());
-            }
-            incColl = incCtx.db()->createCollection(_opCtx, _config.incLong.ns(), options);
+            options.uuid.emplace(UUID::gen());
+
+            incColl = incCtx.db()->createCollection(
+                _opCtx, _config.incLong.ns(), options, false /* force no _id index */);
             invariant(incColl);
 
             auto rawIndexSpec =
@@ -458,7 +462,6 @@ void State::prepTempCollection() {
         Collection* const finalColl = finalCtx.getCollection();
         if (finalColl) {
             finalOptions = finalColl->getCatalogEntry()->getCollectionOptions(_opCtx);
-
             if (_config.finalOutputCollUUID) {
                 // The final output collection's UUID is passed from mongos if the final output
                 // collection is sharded. If a UUID was sent, ensure it matches what's on this
@@ -469,8 +472,7 @@ void State::prepTempCollection() {
                             << _config.outputOptions.finalNamespace.ns()
                             << " does not match UUID for the existing collection with that "
                                "name on this shard",
-                        finalColl->getCatalogEntry()->isEqualToMetadataUUID(
-                            _opCtx, _config.finalOutputCollUUID));
+                        finalColl->uuid() == _config.finalOutputCollUUID);
             }
 
             IndexCatalog::IndexIterator ii =
@@ -509,15 +511,20 @@ void State::prepTempCollection() {
 
         CollectionOptions options = finalOptions;
         options.temp = true;
-        if (enableCollectionUUIDs) {
-            // If a UUID for the final output collection was sent by mongos (i.e., the final output
-            // collection is sharded), use the UUID mongos sent when creating the temp collection.
-            // When the temp collection is renamed to the final output collection, the UUID will be
-            // preserved.
-            options.uuid.emplace(_config.finalOutputCollUUID ? *_config.finalOutputCollUUID
-                                                             : UUID::gen());
-        }
-        tempColl = tempCtx.db()->createCollection(_opCtx, _config.tempNamespace.ns(), options);
+        // If a UUID for the final output collection was sent by mongos (i.e., the final output
+        // collection is sharded), use the UUID mongos sent when creating the temp collection.
+        // When the temp collection is renamed to the final output collection, the UUID will be
+        // preserved.
+        options.uuid.emplace(_config.finalOutputCollUUID ? *_config.finalOutputCollUUID
+                                                         : UUID::gen());
+
+        // Override createCollection's prohibition on creating new replicated collections without an
+        // _id index.
+        bool buildIdIndex = (options.autoIndexId == CollectionOptions::YES ||
+                             options.autoIndexId == CollectionOptions::DEFAULT);
+
+        tempColl = tempCtx.db()->createCollection(
+            _opCtx, _config.tempNamespace.ns(), options, buildIdIndex);
 
         for (vector<BSONObj>::iterator it = indexesToInsert.begin(); it != indexesToInsert.end();
              ++it) {
@@ -647,7 +654,7 @@ unsigned long long _collectionCount(OperationContext* opCtx,
     // If the global write lock is held, we must avoid using AutoGetCollectionForReadCommand as it
     // may lead to deadlock when waiting for a majority snapshot to be committed. See SERVER-24596.
     if (callerHoldsGlobalLock) {
-        Database* db = dbHolder().get(opCtx, nss.ns());
+        Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.ns());
         if (db) {
             coll = db->getCollection(opCtx, nss);
         }
@@ -1011,6 +1018,7 @@ void State::bailFromJS() {
 Collection* State::getCollectionOrUassert(OperationContext* opCtx,
                                           Database* db,
                                           const NamespaceString& nss) {
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     Collection* out = db ? db->getCollection(opCtx, nss) : NULL;
     uassert(18697, "Collection unexpectedly disappeared: " + nss.ns(), out);
     return out;
@@ -1133,8 +1141,7 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHold
                                      std::move(qr),
                                      expCtx,
                                      extensionsCallback,
-                                     MatchExpressionParser::kAllowAllSpecialFeatures &
-                                         ~MatchExpressionParser::AllowedFeatures::kIsolated);
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     verify(statusWithCQ.isOK());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -1397,6 +1404,8 @@ public:
                    string& errmsg,
                    BSONObjBuilder& result) {
         Timer t;
+        // Don't let a lock acquisition in map-reduce get interrupted.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmd))
@@ -1405,9 +1414,7 @@ public:
         auto client = opCtx->getClient();
 
         if (client->isInDirectClient()) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation, "Cannot run mapReduce command from eval()"));
+            uasserted(ErrorCodes::IllegalOperation, "Cannot run mapReduce command from eval()");
         }
 
         auto curOp = CurOp::get(opCtx);
@@ -1423,7 +1430,7 @@ public:
             // Get metadata before we check our version, to make sure it doesn't increment in the
             // meantime
             AutoGetCollectionForReadCommand autoColl(opCtx, config.nss);
-            return CollectionShardingState::get(opCtx, config.nss)->getMetadata();
+            return CollectionShardingState::get(opCtx, config.nss)->getMetadata(opCtx);
         }();
 
         bool shouldHaveData = false;
@@ -1433,10 +1440,8 @@ public:
         try {
             State state(opCtx, config);
             if (!state.sourceExists()) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    Status(ErrorCodes::NamespaceNotFound,
-                           str::stream() << "namespace does not exist: " << config.nss.ns()));
+                uasserted(ErrorCodes::NamespaceNotFound,
+                          str::stream() << "namespace does not exist: " << config.nss.ns());
             }
 
             state.init();
@@ -1493,13 +1498,12 @@ public:
                 const ExtensionsCallbackReal extensionsCallback(opCtx, &config.nss);
 
                 const boost::intrusive_ptr<ExpressionContext> expCtx;
-                auto statusWithCQ = CanonicalQuery::canonicalize(
-                    opCtx,
-                    std::move(qr),
-                    expCtx,
-                    extensionsCallback,
-                    MatchExpressionParser::kAllowAllSpecialFeatures &
-                        ~MatchExpressionParser::AllowedFeatures::kIsolated);
+                auto statusWithCQ =
+                    CanonicalQuery::canonicalize(opCtx,
+                                                 std::move(qr),
+                                                 expCtx,
+                                                 extensionsCallback,
+                                                 MatchExpressionParser::kAllowAllSpecialFeatures);
                 if (!statusWithCQ.isOK()) {
                     uasserted(17238, "Can't canonicalize query " + config.filter.toString());
                     return 0;
@@ -1572,9 +1576,7 @@ public:
                         scopedAutoDb.reset(new AutoGetDb(opCtx, config.nss.db(), MODE_S));
 
                         auto restoreStatus = exec->restoreState();
-                        if (!restoreStatus.isOK()) {
-                            return CommandHelpers::appendCommandStatus(result, restoreStatus);
-                        }
+                        uassertStatusOK(restoreStatus);
 
                         reduceTime += t.micros();
 
@@ -1588,11 +1590,9 @@ public:
                 }
 
                 if (PlanExecutor::DEAD == execState || PlanExecutor::FAILURE == execState) {
-                    return CommandHelpers::appendCommandStatus(
-                        result,
-                        Status(ErrorCodes::OperationFailed,
-                               str::stream() << "Executor error during mapReduce command: "
-                                             << WorkingSetCommon::toStatusString(o)));
+                    uasserted(ErrorCodes::OperationFailed,
+                              str::stream() << "Executor error during mapReduce command: "
+                                            << WorkingSetCommon::toStatusString(o));
                 }
 
                 // Record the indexes used by the PlanExecutor.
@@ -1722,12 +1722,13 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::CommandNotSupported,
-                       str::stream() << "Can not execute mapReduce with output database " << dbname
-                                     << " which lives on config servers"));
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Can not execute mapReduce with output database " << dbname
+                                    << " which lives on config servers");
         }
+
+        // Don't let any lock acquisitions get interrupted.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
@@ -1793,15 +1794,12 @@ public:
 
         state.prepTempCollection();
 
-        std::vector<std::shared_ptr<Chunk>> chunks;
+        std::vector<Chunk> chunks;
 
         if (config.outputOptions.outType != Config::OutputType::INMEMORY) {
             auto outRoutingInfoStatus = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
                 opCtx, config.outputOptions.finalNamespace);
-            if (!outRoutingInfoStatus.isOK()) {
-                return CommandHelpers::appendCommandStatus(result,
-                                                           outRoutingInfoStatus.getStatus());
-            }
+            uassertStatusOK(outRoutingInfoStatus.getStatus());
 
             if (auto cm = outRoutingInfoStatus.getValue().cm()) {
                 // Fetch result from other shards 1 chunk at a time. It would be better to do just
@@ -1809,7 +1807,7 @@ public:
                 const string shardName = ShardingState::get(opCtx)->getShardName();
 
                 for (const auto& chunk : cm->chunks()) {
-                    if (chunk->getShardId() == shardName) {
+                    if (chunk.getShardId() == shardName) {
                         chunks.push_back(chunk);
                     }
                 }
@@ -1823,12 +1821,11 @@ public:
         BSONList values;
 
         while (true) {
-            shared_ptr<Chunk> chunk;
             if (chunks.size() > 0) {
-                chunk = chunks[index];
+                const auto& chunk = chunks[index];
                 BSONObjBuilder b;
-                b.appendAs(chunk->getMin().firstElement(), "$gte");
-                b.appendAs(chunk->getMax().firstElement(), "$lt");
+                b.appendAs(chunk.getMin().firstElement(), "$gte");
+                b.appendAs(chunk.getMax().firstElement(), "$lt");
                 query = BSON("_id" << b.obj());
                 //                        chunkSizes.append(min);
             }
@@ -1871,8 +1868,9 @@ public:
                     values.push_back(t);
             }
 
-            if (chunk) {
-                chunkSizes.append(chunk->getMin());
+            if (chunks.size() > 0) {
+                const auto& chunk = chunks[index];
+                chunkSizes.append(chunk.getMin());
                 chunkSizes.append(chunkSize);
             }
 

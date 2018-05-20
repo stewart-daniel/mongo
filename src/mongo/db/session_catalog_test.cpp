@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/mock_repl_coord_server_fixture.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -48,14 +49,30 @@ protected:
         MockReplCoordServerFixture::setUp();
 
         auto service = opCtx()->getServiceContext();
-        SessionCatalog::reset_forTest(service);
-        SessionCatalog::create(service);
+        SessionCatalog::get(service)->reset_forTest();
         SessionCatalog::get(service)->onStepUp(opCtx());
     }
 
     SessionCatalog* catalog() {
         return SessionCatalog::get(opCtx()->getServiceContext());
     }
+};
+
+// When this class is in scope, makes the system behave as if we're in a DBDirectClient
+class DirectClientSetter {
+public:
+    explicit DirectClientSetter(OperationContext* opCtx)
+        : _opCtx(opCtx), _wasInDirectClient(opCtx->getClient()->isInDirectClient()) {
+        opCtx->getClient()->setInDirectClient(true);
+    }
+
+    ~DirectClientSetter() {
+        _opCtx->getClient()->setInDirectClient(_wasInDirectClient);
+    }
+
+private:
+    const OperationContext* _opCtx;
+    const bool _wasInDirectClient;
 };
 
 TEST_F(SessionCatalogTest, CheckoutAndReleaseSession) {
@@ -67,32 +84,24 @@ TEST_F(SessionCatalogTest, CheckoutAndReleaseSession) {
     ASSERT_EQ(*opCtx()->getLogicalSessionId(), scopedSession->getSessionId());
 }
 
-TEST_F(SessionCatalogTest, OperationContextSession) {
+TEST_F(SessionCatalogTest, OperationContextCheckedOutSession) {
+    opCtx()->setLogicalSessionId(makeLogicalSessionIdForTest());
+    const TxnNumber txnNum = 20;
+    opCtx()->setTxnNumber(txnNum);
+
+    OperationContextSession ocs(opCtx(), true, boost::none, boost::none, "testDB", "insert");
+    auto session = OperationContextSession::get(opCtx());
+    ASSERT(session);
+    ASSERT_EQ(*opCtx()->getLogicalSessionId(), session->getSessionId());
+}
+
+TEST_F(SessionCatalogTest, OperationContextNonCheckedOutSession) {
     opCtx()->setLogicalSessionId(makeLogicalSessionIdForTest());
 
-    {
-        OperationContextSession ocs(opCtx(), true, boost::none);
-        auto session = OperationContextSession::get(opCtx());
+    OperationContextSession ocs(opCtx(), false, boost::none, boost::none, "testDB", "insert");
+    auto session = OperationContextSession::get(opCtx());
 
-        ASSERT(session);
-        ASSERT_EQ(*opCtx()->getLogicalSessionId(), session->getSessionId());
-
-        // Confirm that stash and unstash can be executed against a top-level checked-out Session.
-        ocs.stashTransactionResources();
-        ocs.unstashTransactionResources();
-    }
-
-    {
-        OperationContextSession ocs(opCtx(), false, boost::none);
-        auto session = OperationContextSession::get(opCtx());
-
-        ASSERT(!session);
-
-        // Confirm that stash and unstash can be executed against a top-level not-checked-out
-        // Session.
-        ocs.stashTransactionResources();
-        ocs.unstashTransactionResources();
-    }
+    ASSERT(!session);
 }
 
 TEST_F(SessionCatalogTest, GetOrCreateNonExistentSession) {
@@ -108,7 +117,7 @@ TEST_F(SessionCatalogTest, GetOrCreateSessionAfterCheckOutSession) {
     opCtx()->setLogicalSessionId(lsid);
 
     boost::optional<OperationContextSession> ocs;
-    ocs.emplace(opCtx(), true, boost::none);
+    ocs.emplace(opCtx(), true, boost::none, false, "testDB", "insert");
 
     stdx::async(stdx::launch::async, [&] {
         Client::initThreadIfNotAlready();
@@ -137,10 +146,13 @@ TEST_F(SessionCatalogTest, NestedOperationContextSession) {
     opCtx()->setLogicalSessionId(makeLogicalSessionIdForTest());
 
     {
-        OperationContextSession outerScopedSession(opCtx(), true, boost::none);
+        OperationContextSession outerScopedSession(
+            opCtx(), true, boost::none, boost::none, "testDB", "insert");
 
         {
-            OperationContextSession innerScopedSession(opCtx(), true, boost::none);
+            DirectClientSetter inDirectClient(opCtx());
+            OperationContextSession innerScopedSession(
+                opCtx(), true, boost::none, boost::none, "testDB", "insert");
 
             auto session = OperationContextSession::get(opCtx());
             ASSERT(session);
@@ -148,6 +160,7 @@ TEST_F(SessionCatalogTest, NestedOperationContextSession) {
         }
 
         {
+            DirectClientSetter inDirectClient(opCtx());
             auto session = OperationContextSession::get(opCtx());
             ASSERT(session);
             ASSERT_EQ(*opCtx()->getLogicalSessionId(), session->getSessionId());
@@ -162,7 +175,8 @@ TEST_F(SessionCatalogTest, StashInNestedSessionIsANoop) {
     opCtx()->setTxnNumber(1);
 
     {
-        OperationContextSession outerScopedSession(opCtx(), true, boost::none);
+        OperationContextSession outerScopedSession(
+            opCtx(), true, boost::none, boost::none, "testDB", "find");
 
         Locker* originalLocker = opCtx()->lockState();
         RecoveryUnit* originalRecoveryUnit = opCtx()->recoveryUnit();
@@ -179,19 +193,22 @@ TEST_F(SessionCatalogTest, StashInNestedSessionIsANoop) {
         repl::ReadConcernArgs::get(opCtx()) = readConcernArgs;
 
         // Perform initial unstash, which sets up a WriteUnitOfWork.
-        outerScopedSession.unstashTransactionResources();
+        OperationContextSession::get(opCtx())->unstashTransactionResources(opCtx(), "find");
         ASSERT_EQUALS(originalLocker, opCtx()->lockState());
         ASSERT_EQUALS(originalRecoveryUnit, opCtx()->recoveryUnit());
         ASSERT(opCtx()->getWriteUnitOfWork());
 
         {
-            OperationContextSession innerScopedSession(opCtx(), true, boost::none);
+            // Make it look like we're in a DBDirectClient running a nested operation.
+            DirectClientSetter inDirectClient(opCtx());
+            OperationContextSession innerScopedSession(
+                opCtx(), true, boost::none, boost::none, "testDB", "find");
 
-            // Indicate that there is a stashed cursor. If we were not in a nested session, this
-            // would ensure that stashing is not a noop.
-            opCtx()->setStashedCursor();
+            // Report to Session that there is a stashed cursor. If we were not in a nested session,
+            // this would ensure that stashing is not a noop.
+            Session::registerCursorExistsFunction([](LogicalSessionId, TxnNumber) { return true; });
 
-            innerScopedSession.stashTransactionResources();
+            OperationContextSession::get(opCtx())->stashTransactionResources(opCtx());
 
             // The stash was a noop, so the locker, RecoveryUnit, and WriteUnitOfWork on the
             // OperationContext are unaffected.
@@ -207,7 +224,8 @@ TEST_F(SessionCatalogTest, UnstashInNestedSessionIsANoop) {
     opCtx()->setTxnNumber(1);
 
     {
-        OperationContextSession outerScopedSession(opCtx(), true, boost::none);
+        OperationContextSession outerScopedSession(
+            opCtx(), true, boost::none, boost::none, "testDB", "find");
 
         Locker* originalLocker = opCtx()->lockState();
         RecoveryUnit* originalRecoveryUnit = opCtx()->recoveryUnit();
@@ -224,9 +242,12 @@ TEST_F(SessionCatalogTest, UnstashInNestedSessionIsANoop) {
         repl::ReadConcernArgs::get(opCtx()) = readConcernArgs;
 
         {
-            OperationContextSession innerScopedSession(opCtx(), true, boost::none);
+            // Make it look like we're in a DBDirectClient running a nested operation.
+            DirectClientSetter inDirectClient(opCtx());
+            OperationContextSession innerScopedSession(
+                opCtx(), true, boost::none, boost::none, "testDB", "find");
 
-            innerScopedSession.unstashTransactionResources();
+            OperationContextSession::get(opCtx())->unstashTransactionResources(opCtx(), "find");
 
             // The unstash was a noop, so the OperationContext did not get a WriteUnitOfWork.
             ASSERT_EQUALS(originalLocker, opCtx()->lockState());
@@ -236,18 +257,40 @@ TEST_F(SessionCatalogTest, UnstashInNestedSessionIsANoop) {
     }
 }
 
-TEST_F(SessionCatalogTest, OnlyCheckOutSessionWithCheckOutSessionTrue) {
-    opCtx()->setLogicalSessionId(makeLogicalSessionIdForTest());
+TEST_F(SessionCatalogTest, ScanSessions) {
+    std::vector<LogicalSessionId> lsids;
+    auto workerFn = [&](OperationContext* opCtx, Session* session) {
+        lsids.push_back(session->getSessionId());
+    };
 
+    // Scan over zero Sessions.
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx())});
+    catalog()->scanSessions(opCtx(), matcherAllSessions, workerFn);
+    ASSERT(lsids.empty());
+
+    // Create three sessions in the catalog.
+    auto lsid1 = makeLogicalSessionIdForTest();
+    auto lsid2 = makeLogicalSessionIdForTest();
+    auto lsid3 = makeLogicalSessionIdForTest();
     {
-        OperationContextSession ocs(opCtx(), true, boost::none);
-        ASSERT(OperationContextSession::get(opCtx()));
+        auto scopedSession1 = catalog()->getOrCreateSession(opCtx(), lsid1);
+        auto scopedSession2 = catalog()->getOrCreateSession(opCtx(), lsid2);
+        auto scopedSession3 = catalog()->getOrCreateSession(opCtx(), lsid3);
     }
 
-    {
-        OperationContextSession ocs(opCtx(), false, boost::none);
-        ASSERT(!OperationContextSession::get(opCtx()));
-    }
+    // Scan over all Sessions.
+    lsids.clear();
+    catalog()->scanSessions(opCtx(), matcherAllSessions, workerFn);
+    ASSERT_EQ(lsids.size(), 3U);
+
+    // Scan over all Sessions, visiting a particular Session.
+    SessionKiller::Matcher matcherLSID2(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx(), lsid2)});
+    lsids.clear();
+    catalog()->scanSessions(opCtx(), matcherLSID2, workerFn);
+    ASSERT_EQ(lsids.size(), 1U);
+    ASSERT_EQ(lsids.front(), lsid2);
 }
 
 }  // namespace

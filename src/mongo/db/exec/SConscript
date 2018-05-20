@@ -46,6 +46,9 @@ env.Library(
         "$BUILD_DIR/mongo/db/index/index_access_methods",
         "$BUILD_DIR/mongo/db/query_exec",
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+    ],
 )
 
 env.CppUnitTest(
@@ -54,6 +57,7 @@ env.CppUnitTest(
         "queued_data_stage_test.cpp",
     ],
     LIBDEPS = [
+        "$BUILD_DIR/mongo/db/auth/authmocks",
         "$BUILD_DIR/mongo/db/query_exec",
         "$BUILD_DIR/mongo/db/serveronly",
         "$BUILD_DIR/mongo/db/service_context_d",
@@ -68,6 +72,7 @@ env.CppUnitTest(
         "sort_test.cpp",
     ],
     LIBDEPS = [
+        "$BUILD_DIR/mongo/db/auth/authmocks",
         "$BUILD_DIR/mongo/db/query_exec",
         "$BUILD_DIR/mongo/db/serveronly",
         "$BUILD_DIR/mongo/db/service_context_d",
@@ -84,6 +89,7 @@ env.CppUnitTest(
         "projection_exec_test.cpp",
     ],
     LIBDEPS = [
+        "$BUILD_DIR/mongo/db/auth/authmocks",
         "$BUILD_DIR/mongo/db/query_exec",
         "$BUILD_DIR/mongo/db/query/collation/collator_interface_mock",
         "$BUILD_DIR/mongo/db/query/query_test_service_context",

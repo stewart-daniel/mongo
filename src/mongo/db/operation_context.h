@@ -37,8 +37,8 @@
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
@@ -54,7 +54,6 @@ class CurOp;
 class ProgressMeter;
 class ServiceContext;
 class StringData;
-class WriteUnitOfWork;
 
 namespace repl {
 class UnreplicatedWritesBlock;
@@ -75,15 +74,6 @@ class OperationContext : public Decorable<OperationContext> {
     MONGO_DISALLOW_COPYING(OperationContext);
 
 public:
-    /**
-     * The RecoveryUnitState is used by WriteUnitOfWork to ensure valid state transitions.
-     */
-    enum RecoveryUnitState {
-        kNotInUnitOfWork,   // not in a unit of work, no writes allowed
-        kActiveUnitOfWork,  // in a unit of work that still may either commit or abort
-        kFailedUnitOfWork   // in a unit of work that has failed and must be aborted
-    };
-
     OperationContext(Client* client, unsigned int opId);
 
     virtual ~OperationContext() = default;
@@ -115,7 +105,8 @@ public:
      * returned separately even though the state logically belongs to the RecoveryUnit,
      * as it is managed by the OperationContext.
      */
-    RecoveryUnitState setRecoveryUnit(RecoveryUnit* unit, RecoveryUnitState state);
+    WriteUnitOfWork::RecoveryUnitState setRecoveryUnit(RecoveryUnit* unit,
+                                                       WriteUnitOfWork::RecoveryUnitState state);
 
     /**
      * Interface for locking.  Caller DOES NOT own pointer.
@@ -286,6 +277,20 @@ public:
     }
 
     /**
+     * Sets a transport Baton on the operation.  This will trigger the Baton on markKilled.
+     */
+    void setBaton(const transport::BatonHandle& baton) {
+        _baton = baton;
+    }
+
+    /**
+     * Retrieves the baton associated with the operation.
+     */
+    const transport::BatonHandle& getBaton() const {
+        return _baton;
+    }
+
+    /**
      * Associates a transaction number with this operation context. May only be called once for the
      * lifetime of the operation and the operation must have a logical session id assigned.
      */
@@ -406,14 +411,6 @@ public:
     }
 
     /**
-     * Reset the deadline for this operation.
-     */
-    void clearDeadline() {
-        _deadline = Date_t::max();
-        _maxTime = computeMaxTimeFromDeadline(_deadline);
-    }
-
-    /**
      * Returns the number of milliseconds remaining for this operation's time limit or
      * Milliseconds::max() if the operation has no time limit.
      */
@@ -427,20 +424,6 @@ public:
      * value Microseconds::max() if the operation has no time limit.
      */
     Microseconds getRemainingMaxTimeMicros() const;
-
-    /**
-     * Indicate that the current network operation will leave an open client cursor on completion.
-     */
-    void setStashedCursor() {
-        _hasStashedCursor = true;
-    }
-
-    /**
-     * Returns whether the current network operation will leave an open client cursor on completion.
-     */
-    bool hasStashedCursor() {
-        return _hasStashedCursor;
-    }
 
 private:
     /**
@@ -484,7 +467,8 @@ private:
     std::unique_ptr<Locker> _locker;
 
     std::unique_ptr<RecoveryUnit> _recoveryUnit;
-    RecoveryUnitState _ruState = kNotInUnitOfWork;
+    WriteUnitOfWork::RecoveryUnitState _ruState =
+        WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork;
 
     // Operations run within a transaction will hold a WriteUnitOfWork for the duration in order
     // to maintain two-phase locking.
@@ -495,6 +479,9 @@ private:
     // once from OK to some kill code.
     AtomicWord<ErrorCodes::Error> _killCode{ErrorCodes::OK};
 
+    // A transport Baton associated with the operation. The presence of this object implies that a
+    // client thread is doing it's own async networking by blocking on it's own thread.
+    transport::BatonHandle _baton;
 
     // If non-null, _waitMutex and _waitCV are the (mutex, condition variable) pair that the
     // operation is currently waiting on inside a call to waitForConditionOrInterrupt...().
@@ -525,88 +512,6 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
-
-    // When true, the cursor used by this operation will be stashed for use by a subsequent network
-    // operation.
-    bool _hasStashedCursor = false;
-};
-
-class WriteUnitOfWork {
-    MONGO_DISALLOW_COPYING(WriteUnitOfWork);
-
-public:
-    WriteUnitOfWork() = default;
-
-    WriteUnitOfWork(OperationContext* opCtx)
-        : _opCtx(opCtx), _toplevel(opCtx->_ruState == OperationContext::kNotInUnitOfWork) {
-        uassert(ErrorCodes::IllegalOperation,
-                "Cannot execute a write operation in read-only mode",
-                !storageGlobalParams.readOnly);
-        _opCtx->lockState()->beginWriteUnitOfWork();
-        if (_toplevel) {
-            _opCtx->recoveryUnit()->beginUnitOfWork(_opCtx);
-            _opCtx->_ruState = OperationContext::kActiveUnitOfWork;
-        }
-    }
-
-    ~WriteUnitOfWork() {
-        dassert(!storageGlobalParams.readOnly);
-        if (!_released && !_committed) {
-            invariant(_opCtx->_ruState != OperationContext::kNotInUnitOfWork);
-            if (_toplevel) {
-                _opCtx->recoveryUnit()->abortUnitOfWork();
-                _opCtx->_ruState = OperationContext::kNotInUnitOfWork;
-            } else {
-                _opCtx->_ruState = OperationContext::kFailedUnitOfWork;
-            }
-            _opCtx->lockState()->endWriteUnitOfWork();
-        }
-    }
-
-    /**
-     * Creates a top-level WriteUnitOfWork without changing RecoveryUnit or Locker state. For use
-     * when the RecoveryUnit and Locker are already in an active state.
-     */
-    static std::unique_ptr<WriteUnitOfWork> createForSnapshotResume(OperationContext* opCtx) {
-        auto wuow = stdx::make_unique<WriteUnitOfWork>();
-        wuow->_opCtx = opCtx;
-        wuow->_toplevel = true;
-        wuow->_opCtx->_ruState = OperationContext::kActiveUnitOfWork;
-        return wuow;
-    }
-
-    /**
-     * Releases the OperationContext RecoveryUnit and Locker objects from management without
-     * changing state. Allows for use of these objects beyond the WriteUnitOfWork lifespan.
-     */
-    void release() {
-        invariant(_opCtx->_ruState == OperationContext::kActiveUnitOfWork);
-        invariant(!_committed);
-        invariant(_toplevel);
-
-        _released = true;
-        _opCtx->_ruState = OperationContext::kNotInUnitOfWork;
-    }
-
-    void commit() {
-        invariant(!_committed);
-        invariant(!_released);
-        invariant(_opCtx->_ruState == OperationContext::kActiveUnitOfWork);
-        if (_toplevel) {
-            _opCtx->recoveryUnit()->commitUnitOfWork();
-            _opCtx->_ruState = OperationContext::kNotInUnitOfWork;
-        }
-        _opCtx->lockState()->endWriteUnitOfWork();
-        _committed = true;
-    }
-
-private:
-    OperationContext* _opCtx;
-
-    bool _toplevel;
-
-    bool _committed = false;
-    bool _released = false;
 };
 
 namespace repl {

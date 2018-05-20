@@ -1,7 +1,9 @@
 // SERVER-7200 On startup, replica set nodes delete oplog state past the oplog delete point and
 // apply any remaining unapplied ops before coming up as a secondary.
 //
-// @tags: [requires_persistence]
+// This test requires mmapv1 because rollback to a stable timestamp does not allow arbitrary
+// writes to the minValid document. This has been replaced by unittests.
+// @tags: [requires_persistence, requires_mmapv1]
 (function() {
     "use strict";
 
@@ -18,9 +20,6 @@
     var nojournal = Array.contains(conn.adminCommand({getCmdLineOpts: 1}).argv, '--nojournal');
     var storageEngine = jsTest.options().storageEngine;
     var term = conn.getCollection('local.oplog.rs').find().sort({$natural: -1}).limit(1).next().t;
-    if (typeof(term) == 'undefined') {
-        term = -1;  // Use a dummy term for PV0.
-    }
 
     function runTest({
         oplogEntries,
@@ -59,9 +58,10 @@
             assert.writeOK(oplog.insert({
                 ts: ts(num),
                 t: NumberLong(term),
-                h: 1,
+                h: NumberLong(1),
                 op: 'i',
                 ns: ns,
+                v: 2,
                 o: {_id: num},
             }));
         });
@@ -104,11 +104,17 @@
                   injectedOplogTruncateAfterPointDoc,
                   "If the Timestamps differ, the server may be filling in the null timestamps");
 
-        try {
-            conn = rst.restart(0);  // Restart in replSet mode again.
-        } catch (e) {
-            assert.eq(expectedState, 'FATAL', 'node failed to restart: ' + e);
+        rst.stop(0);
+
+        if (expectedState === 'FATAL') {
+            try {
+                rst.start(0, {waitForConnect: true}, true);
+            } catch (e) {
+            }
+            rst.stop(0, undefined, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
             return;
+        } else {
+            conn = rst.start(0, {waitForConnect: true}, true);
         }
 
         // Wait for the node to go to SECONDARY if it is able.

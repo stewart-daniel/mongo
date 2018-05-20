@@ -114,13 +114,17 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool run(OperationContext* opCtx,
              const std::string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+
+        // Set the operation context read concern level to local for reads into the config database.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
         const NamespaceString nss = NamespaceString(parseNs(dbName, cmdObj));
 
@@ -134,10 +138,9 @@ public:
             commitRequest.getControlChunk(),
             commitRequest.getCollectionEpoch(),
             commitRequest.getFromShard(),
-            commitRequest.getToShard());
-        if (!response.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, response.getStatus());
-        }
+            commitRequest.getToShard(),
+            commitRequest.getValidAfter());
+        uassertStatusOK(response.getStatus());
         result.appendElements(response.getValue());
         return true;
     }

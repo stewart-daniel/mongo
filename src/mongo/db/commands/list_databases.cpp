@@ -31,10 +31,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
@@ -92,11 +93,10 @@ public:
         std::unique_ptr<MatchExpression> filter;
         if (auto filterElt = jsobj[kFilterField]) {
             if (filterElt.type() != BSONType::Object) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    {ErrorCodes::TypeMismatch,
-                     str::stream() << "Field '" << kFilterField << "' must be of type Object in: "
-                                   << jsobj});
+                uasserted(ErrorCodes::TypeMismatch,
+                          str::stream() << "Field '" << kFilterField
+                                        << "' must be of type Object in: "
+                                        << jsobj);
             }
             // The collator is null because database metadata objects are compared using simple
             // binary comparison.
@@ -104,17 +104,15 @@ public:
             boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
             auto statusWithMatcher =
                 MatchExpressionParser::parse(filterElt.Obj(), std::move(expCtx));
-            if (!statusWithMatcher.isOK()) {
-                return CommandHelpers::appendCommandStatus(result, statusWithMatcher.getStatus());
-            }
+            uassertStatusOK(statusWithMatcher.getStatus());
             filter = std::move(statusWithMatcher.getValue());
         }
         bool nameOnly = jsobj[kNameOnlyField].trueValue();
 
         vector<string> dbNames;
-        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
         {
-            Lock::GlobalLock lk(opCtx, MODE_IS, Date_t::max());
+            Lock::GlobalLock lk(opCtx, MODE_IS);
             storageEngine->listDatabases(&dbNames);
         }
 
@@ -157,7 +155,8 @@ public:
                 const DatabaseCatalogEntry* entry = db->getDatabaseCatalogEntry();
                 invariant(entry);
 
-                size = entry->sizeOnDisk(opCtx);
+                writeConflictRetry(
+                    opCtx, "sizeOnDisk", dbname, [&] { size = entry->sizeOnDisk(opCtx); });
                 b.append("sizeOnDisk", static_cast<double>(size));
 
                 b.appendBool("empty", entry->isEmpty());

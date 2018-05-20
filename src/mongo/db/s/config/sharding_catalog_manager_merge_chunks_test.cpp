@@ -67,12 +67,15 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
 
     setupChunks({chunk, chunk2}).transitional_ignore();
 
+    Timestamp validAfter{100, 0};
+
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->commitChunkMerge(operationContext(),
-                                     NamespaceString("TestDB.TestColl"),
+                                     kNamespace,
                                      origVersion.epoch(),
                                      chunkBoundaries,
-                                     "shard0000"));
+                                     "shard0000",
+                                     validAfter));
 
     auto findResponse = uassertStatusOK(
         getConfigShard()->exhaustiveFindOnConfig(operationContext(),
@@ -98,6 +101,10 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
         ASSERT_EQ(origVersion.majorVersion(), mergedChunk.getVersion().majorVersion());
         ASSERT_EQ(origVersion.minorVersion() + 1, mergedChunk.getVersion().minorVersion());
     }
+
+    // Make sure history is there
+    ASSERT_EQ(1UL, mergedChunk.getHistory().size());
+    ASSERT_EQ(validAfter, mergedChunk.getHistory().front().getValidAfter());
 }
 
 TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
@@ -131,12 +138,15 @@ TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
 
     setupChunks({chunk, chunk2, chunk3}).transitional_ignore();
 
+    Timestamp validAfter{100, 0};
+
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->commitChunkMerge(operationContext(),
-                                     NamespaceString("TestDB.TestColl"),
+                                     kNamespace,
                                      origVersion.epoch(),
                                      chunkBoundaries,
-                                     "shard0000"));
+                                     "shard0000",
+                                     validAfter));
 
     auto findResponse = uassertStatusOK(
         getConfigShard()->exhaustiveFindOnConfig(operationContext(),
@@ -162,6 +172,10 @@ TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
         ASSERT_EQ(origVersion.majorVersion(), mergedChunk.getVersion().majorVersion());
         ASSERT_EQ(origVersion.minorVersion() + 1, mergedChunk.getVersion().minorVersion());
     }
+
+    // Make sure history is there
+    ASSERT_EQ(1UL, mergedChunk.getHistory().size());
+    ASSERT_EQ(validAfter, mergedChunk.getHistory().front().getValidAfter());
 }
 
 TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
@@ -199,12 +213,15 @@ TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
 
     setupChunks({chunk, chunk2, otherChunk}).transitional_ignore();
 
+    Timestamp validAfter{100, 0};
+
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->commitChunkMerge(operationContext(),
-                                     NamespaceString("TestDB.TestColl"),
+                                     kNamespace,
                                      collEpoch,
                                      chunkBoundaries,
-                                     "shard0000"));
+                                     "shard0000",
+                                     validAfter));
 
     auto findResponse = uassertStatusOK(
         getConfigShard()->exhaustiveFindOnConfig(operationContext(),
@@ -230,6 +247,10 @@ TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
         ASSERT_EQ(competingVersion.majorVersion(), mergedChunk.getVersion().majorVersion());
         ASSERT_EQ(competingVersion.minorVersion() + 1, mergedChunk.getVersion().minorVersion());
     }
+
+    // Make sure history is there
+    ASSERT_EQ(1UL, mergedChunk.getHistory().size());
+    ASSERT_EQ(validAfter, mergedChunk.getHistory().front().getValidAfter());
 }
 
 TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
@@ -263,12 +284,15 @@ TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
 
     setupChunks({chunk, chunk2, otherChunk}).transitional_ignore();
 
+    Timestamp validAfter{1};
+
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->commitChunkMerge(operationContext(),
-                                     NamespaceString("TestDB.TestColl"),
+                                     kNamespace,
                                      origVersion.epoch(),
                                      chunkBoundaries,
-                                     "shard0000"));
+                                     "shard0000",
+                                     validAfter));
 
     auto findResponse = uassertStatusOK(
         getConfigShard()->exhaustiveFindOnConfig(operationContext(),
@@ -326,12 +350,15 @@ TEST_F(MergeChunkTest, NonExistingNamespace) {
 
     setupChunks({chunk, chunk2}).transitional_ignore();
 
+    Timestamp validAfter{1};
+
     auto mergeStatus = ShardingCatalogManager::get(operationContext())
                            ->commitChunkMerge(operationContext(),
                                               NamespaceString("TestDB.NonExistingColl"),
                                               origVersion.epoch(),
                                               chunkBoundaries,
-                                              "shard0000");
+                                              "shard0000",
+                                              validAfter);
     ASSERT_EQ(ErrorCodes::IllegalOperation, mergeStatus);
 }
 
@@ -360,12 +387,15 @@ TEST_F(MergeChunkTest, NonMatchingEpochsOfChunkAndRequestErrors) {
 
     setupChunks({chunk, chunk2}).transitional_ignore();
 
+    Timestamp validAfter{1};
+
     auto mergeStatus = ShardingCatalogManager::get(operationContext())
                            ->commitChunkMerge(operationContext(),
-                                              NamespaceString("TestDB.TestColl"),
+                                              kNamespace,
                                               OID::gen(),
                                               chunkBoundaries,
-                                              "shard0000");
+                                              "shard0000",
+                                              validAfter);
     ASSERT_EQ(ErrorCodes::StaleEpoch, mergeStatus);
 }
 
@@ -400,13 +430,16 @@ TEST_F(MergeChunkTest, MergeAlreadyHappenedFailsPrecondition) {
 
     setupChunks({mergedChunk}).transitional_ignore();
 
+    Timestamp validAfter{1};
+
     ASSERT_EQ(ErrorCodes::BadValue,
               ShardingCatalogManager::get(operationContext())
                   ->commitChunkMerge(operationContext(),
-                                     NamespaceString("TestDB.TestColl"),
+                                     kNamespace,
                                      origVersion.epoch(),
                                      chunkBoundaries,
-                                     "shard0000"));
+                                     "shard0000",
+                                     validAfter));
 
     // Verify that no change to config.chunks happened.
     auto findResponse = uassertStatusOK(
@@ -461,13 +494,83 @@ TEST_F(MergeChunkTest, ChunkBoundariesOutOfOrderFails) {
         setupChunks(originalChunks).transitional_ignore();
     }
 
-    ASSERT_EQ(ErrorCodes::InvalidOptions,
-              ShardingCatalogManager::get(operationContext())
+    Timestamp validAfter{1};
+
+    ASSERT_EQ(
+        ErrorCodes::InvalidOptions,
+        ShardingCatalogManager::get(operationContext())
+            ->commitChunkMerge(
+                operationContext(), kNamespace, epoch, chunkBoundaries, "shard0000", validAfter));
+}
+
+TEST_F(MergeChunkTest, MergingChunksWithDollarPrefixShouldSucceed) {
+    ChunkType chunk1;
+    chunk1.setNS(kNamespace);
+
+    auto origVersion = ChunkVersion(1, 0, OID::gen());
+    chunk1.setVersion(origVersion);
+    chunk1.setShard(ShardId("shard0000"));
+
+    auto chunk2(chunk1);
+    auto chunk3(chunk1);
+
+    auto chunkMin = BSON("a" << kMinBSONKey);
+    auto chunkBound1 = BSON("a" << BSON("$maxKey" << 1));
+    auto chunkBound2 = BSON("a" << BSON("$mixKey" << 1));
+    auto chunkMax = BSON("a" << kMaxBSONKey);
+
+    // first chunk boundaries
+    chunk1.setMin(chunkMin);
+    chunk1.setMax(chunkBound1);
+    // second chunk boundaries
+    chunk2.setMin(chunkBound1);
+    chunk2.setMax(chunkBound2);
+    // third chunk boundaries
+    chunk3.setMin(chunkBound2);
+    chunk3.setMax(chunkMax);
+
+    ASSERT_OK(setupChunks({chunk1, chunk2, chunk3}));
+
+    // Record chunk boundaries for passing into commitChunkMerge
+    std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound1, chunkBound2, chunkMax};
+    Timestamp validAfter{100, 0};
+
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->commitChunkMerge(operationContext(),
-                                     NamespaceString("TestDB.TestColl"),
-                                     epoch,
+                                     kNamespace,
+                                     origVersion.epoch(),
                                      chunkBoundaries,
-                                     "shard0000"));
+                                     "shard0000",
+                                     validAfter));
+
+    auto findResponse = uassertStatusOK(
+        getConfigShard()->exhaustiveFindOnConfig(operationContext(),
+                                                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                                 repl::ReadConcernLevel::kLocalReadConcern,
+                                                 ChunkType::ConfigNS,
+                                                 BSON(ChunkType::ns() << "TestDB.TestColl"),
+                                                 BSON(ChunkType::lastmod << -1),
+                                                 boost::none));
+
+    const auto& chunksVector = findResponse.docs;
+
+    // There should be exactly one chunk left in the collection
+    ASSERT_EQ(1u, chunksVector.size());
+
+    // MergedChunk should have range [chunkMin, chunkMax]
+    auto mergedChunk = uassertStatusOK(ChunkType::fromConfigBSON(chunksVector.front()));
+    ASSERT_BSONOBJ_EQ(chunkMin, mergedChunk.getMin());
+    ASSERT_BSONOBJ_EQ(chunkMax, mergedChunk.getMax());
+
+    {
+        // Check for increment on mergedChunk's minor version
+        ASSERT_EQ(origVersion.majorVersion(), mergedChunk.getVersion().majorVersion());
+        ASSERT_EQ(origVersion.minorVersion() + 1, mergedChunk.getVersion().minorVersion());
+    }
+
+    // Make sure history is there
+    ASSERT_EQ(1UL, mergedChunk.getHistory().size());
+    ASSERT_EQ(validAfter, mergedChunk.getHistory().front().getValidAfter());
 }
 
 }  // namespace

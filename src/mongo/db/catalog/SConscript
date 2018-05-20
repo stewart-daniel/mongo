@@ -20,6 +20,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/command_generic_argument',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface',
         '$BUILD_DIR/mongo/db/server_parameters',
     ],
@@ -33,6 +34,7 @@ env.CppUnitTest(
     source = 'collection_test.cpp',
     LIBDEPS=[
         'catalog_helpers',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
@@ -129,34 +131,7 @@ env.Library(
         "database.cpp",
     ],
     LIBDEPS=[
-    ],
-)
-
-env.Library(
-    target='catalog_raii',
-    source=[
-        'catalog_raii.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/catalog/database_holder',
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/views/views',
-        'collection',
-        'database',
-        'uuid_catalog',
-    ],
-)
-
-env.CppUnitTest(
-    target='catalog_raii_test',
-    source=[
-        'catalog_raii_test.cpp',
-    ],
-    LIBDEPS=[
-        'database_holder_mock',
-        '$BUILD_DIR/mongo/db/catalog/catalog_raii',
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
-        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -168,6 +143,7 @@ env.CppUnitTest(
     LIBDEPS=[
         'database',
         'index_create',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',
@@ -219,7 +195,6 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/storage/storage_options',
-        '$BUILD_DIR/mongo/util/decorable',
     ],
 )
 
@@ -251,8 +226,18 @@ env.Library(
         'database_holder_mock.cpp',
     ],
     LIBDEPS=[
-	'database_holder',
+        'database_holder',
         '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Library(
+    target='index_create_impl_servers',
+    source=[
+        'index_create_impl_servers.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        'catalog_impl',
     ],
 )
 
@@ -290,6 +275,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/index/index_access_method',
         '$BUILD_DIR/mongo/db/index_d',
+        '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/repair_database',
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
@@ -304,7 +290,9 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/logical_clock',
+        '$BUILD_DIR/mongo/db/repl/repl_settings',
         '$BUILD_DIR/mongo/db/storage/mmap_v1/mmap_v1_options',
+        '$BUILD_DIR/mongo/db/storage/storage_engine_common',
     ],
 )
 
@@ -341,6 +329,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'catalog_helpers',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
@@ -358,6 +347,7 @@ env.CppUnitTest(
     LIBDEPS=[
         'catalog_helpers',
         'uuid_catalog',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
@@ -375,6 +365,7 @@ env.CppUnitTest(
     LIBDEPS=[
         'catalog_helpers',
         'index_create',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
@@ -393,6 +384,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'catalog_helpers',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',

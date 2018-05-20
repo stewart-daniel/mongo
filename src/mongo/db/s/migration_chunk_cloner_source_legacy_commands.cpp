@@ -35,13 +35,13 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
 #include "mongo/db/s/migration_source_manager.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/write_concern.h"
 
 /**
@@ -60,9 +60,7 @@ class AutoGetActiveCloner {
 
 public:
     AutoGetActiveCloner(OperationContext* opCtx, const MigrationSessionId& migrationSessionId) {
-        ShardingState* const gss = ShardingState::get(opCtx);
-
-        const auto nss = gss->getActiveDonateChunkNss();
+        const auto nss = ActiveMigrationsRegistry::get(opCtx).getActiveDonateChunkNss();
         uassert(ErrorCodes::NotYetInitialized, "No active migrations were found", nss);
 
         // Once the collection is locked, the migration status cannot change
@@ -72,15 +70,16 @@ public:
                 str::stream() << "Collection " << nss->ns() << " does not exist",
                 _autoColl->getCollection());
 
-        auto css = CollectionShardingState::get(opCtx, *nss);
-        uassert(ErrorCodes::IllegalOperation,
-                str::stream() << "No active migrations were found for collection " << nss->ns(),
-                css->getMigrationSourceManager());
+        if (auto msm = MigrationSourceManager::get(CollectionShardingState::get(opCtx, *nss))) {
+            // It is now safe to access the cloner
+            _chunkCloner = dynamic_cast<MigrationChunkClonerSourceLegacy*>(msm->getCloner());
+            invariant(_chunkCloner);
 
-        // It is now safe to access the cloner
-        _chunkCloner = dynamic_cast<MigrationChunkClonerSourceLegacy*>(
-            css->getMigrationSourceManager()->getCloner());
-        invariant(_chunkCloner);
+        } else {
+            uasserted(ErrorCodes::IllegalOperation,
+                      str::stream() << "No active migrations were found for collection "
+                                    << nss->ns());
+        }
 
         // Ensure the session ids are correct
         uassert(ErrorCodes::IllegalOperation,

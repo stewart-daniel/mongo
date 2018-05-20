@@ -244,5 +244,30 @@ TEST(ServerParameters, Vector1) {
     ASSERT_EQUALS("e", v[1]);
 }
 
+TEST(ServerParameters, Validators) {
+    AtomicInt32 myVal(0);
+    ExportedServerParameter<int, ServerParameterType::kRuntimeOnly> myParam(
+        nullptr, "myVal", &myVal);
+    myParam.withValidator([](const int& newVal) {
+        if (newVal < 0) {
+            return Status(ErrorCodes::BadValue, "Must be positive");
+        }
+        return Status::OK();
+    });
+
+    ASSERT_OK(myParam.set(10));
+    ASSERT_EQUALS(10, myVal.load());
+    ASSERT_EQUALS(ErrorCodes::BadValue, myParam.set(-1));
+    ASSERT_EQUALS(10, myVal.load());
+}
+
+MONGO_EXPORT_SERVER_PARAMETER(oddTestParameter, int, 123)
+    ->withValidator([](const int& newVal) {
+        if ((newVal & 1) == 0) {
+            return Status(ErrorCodes::BadValue, "must be odd");
+        }
+        return Status::OK();
+    });
+
 }  // namespace
 }  // namespace mongo

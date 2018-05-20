@@ -36,11 +36,8 @@
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_document.h"
 #include "mongo/db/logical_clock.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/config_server_test_fixture.h"
-#include "mongo/s/grid.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
@@ -59,14 +56,17 @@ protected:
             Grid::get(operationContext())->catalogClient());
     }
 
-    std::unique_ptr<DistLockManager> makeDistLockManager(
-        std::unique_ptr<DistLockCatalog> distLockCatalog) override {
-        invariant(distLockCatalog);
-        return stdx::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
-    }
-
     KeysCollectionClient* catalogClient() const {
         return _catalogClient.get();
+    }
+
+    /**
+     * Intentionally create a DistLockManagerMock, even though this is a config serfver test in
+     * order to avoid the lock pinger thread from executing and accessing uninitialized state.
+     */
+    std::unique_ptr<DistLockManager> makeDistLockManager(
+        std::unique_ptr<DistLockCatalog> distLockCatalog) override {
+        return stdx::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
     }
 
 private:

@@ -33,7 +33,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_command.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
@@ -52,21 +52,19 @@ private:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
+        uassertStatusOK(status);
 
         ReplSetRequestVotesArgs parsedArgs;
         status = parsedArgs.initialize(cmdObj);
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
+        uassertStatusOK(status);
 
         ReplSetRequestVotesResponse response;
         status = ReplicationCoordinator::get(opCtx)->processReplSetRequestVotes(
             opCtx, parsedArgs, &response);
+        uassertStatusOK(status);
+
         response.addToBSON(&result);
-        return CommandHelpers::appendCommandStatus(result, status);
+        return true;
     }
 } cmdReplSetRequestVotes;
 

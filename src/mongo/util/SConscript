@@ -59,22 +59,12 @@ debuggerEnv.Library(
     ]
 )
 
-env.Library(
-    target='decorable',
-    source=[
-        'decoration_container.cpp',
-        'decoration_registry.cpp',
-    ],
-    LIBDEPS=[]
-    )
-
 env.CppUnitTest(
     target='decorable_test',
     source=[
         'decorable_test.cpp'
         ],
     LIBDEPS=[
-        'decorable',
         ]
     )
 
@@ -267,28 +257,26 @@ env.Library(
 )
 
 env.Library(
-    target="periodic_runner_asio",
+    target="periodic_runner_impl",
     source=[
-        "periodic_runner_asio.cpp",
+        "periodic_runner_impl.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/service_context",
-        "$BUILD_DIR/third_party/shim_asio",
-        "$BUILD_DIR/mongo/executor/async_timer_asio",
         "periodic_runner",
     ],
 )
 
 env.CppUnitTest(
-    target="periodic_runner_asio_test",
+    target="periodic_runner_impl_test",
     source=[
-        "periodic_runner_asio_test.cpp",
+        "periodic_runner_impl_test.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context_noop_init',
-        "$BUILD_DIR/mongo/executor/async_timer_mock",
-        "periodic_runner_asio",
+        "clock_source_mock",
+        "periodic_runner_impl",
     ],
 )
 
@@ -298,8 +286,9 @@ env.Library(
         'periodic_runner_factory.cpp',
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/db/service_context",
         'periodic_runner',
-        'periodic_runner_asio',
+        'periodic_runner_impl',
     ],
 )
 
@@ -353,9 +342,12 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
             'heap_profiler.cpp',
         ],
         LIBDEPS=[
-            '$BUILD_DIR/mongo/db/commands/server_status',
             '$BUILD_DIR/mongo/db/server_parameters',
-            '$BUILD_DIR/mongo/util/net/network',
+            '$BUILD_DIR/mongo/transport/service_executor',
+        ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/db/commands/server_status',
+            'processinfo',
         ],
         LIBDEPS_DEPENDENTS=[
             '$BUILD_DIR/mongo/mongodmain',
@@ -608,6 +600,17 @@ env.CppUnitTest(
 )
 
 env.CppUnitTest(
+    target='producer_consumer_queue_test',
+    source=[
+        'producer_consumer_queue_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+    ]
+)
+
+env.CppUnitTest(
     target='duration_test',
     source=[
         'duration_test.cpp',
@@ -633,6 +636,25 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target='future_test',
+    source=[
+        'future_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Benchmark(
+    target='future_bm',
+    source=[
+        'future_bm.cpp',
+    ],
+    LIBDEPS=[
     ],
 )
 

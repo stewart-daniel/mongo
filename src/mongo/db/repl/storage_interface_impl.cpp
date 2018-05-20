@@ -59,6 +59,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/update.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/logical_clock.h"
@@ -71,7 +72,6 @@
 #include "mongo/db/repl/collection_bulk_loader_impl.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/rollback_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
@@ -278,10 +278,10 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
 }
 
 Status StorageInterfaceImpl::insertDocument(OperationContext* opCtx,
-                                            const NamespaceString& nss,
+                                            const NamespaceStringOrUUID& nsOrUUID,
                                             const TimestampedBSONObj& doc,
                                             long long term) {
-    return insertDocuments(opCtx, nss, {InsertStatement(doc.obj, doc.timestamp, term)});
+    return insertDocuments(opCtx, nsOrUUID, {InsertStatement(doc.obj, doc.timestamp, term)});
 }
 
 namespace {
@@ -292,30 +292,32 @@ namespace {
  */
 template <typename AutoGetCollectionType>
 StatusWith<Collection*> getCollection(const AutoGetCollectionType& autoGetCollection,
-                                      const NamespaceString& nss,
+                                      const NamespaceStringOrUUID& nsOrUUID,
                                       const std::string& message) {
     if (!autoGetCollection.getDb()) {
+        StringData dbName = nsOrUUID.nss() ? nsOrUUID.nss()->db() : nsOrUUID.dbname();
         return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Database [" << nss.db() << "] not found. " << message};
+                str::stream() << "Database [" << dbName << "] not found. " << message};
     }
 
     auto collection = autoGetCollection.getCollection();
     if (!collection) {
         return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Collection [" << nss.ns() << "] not found. " << message};
+                str::stream() << "Collection [" << nsOrUUID.toString() << "] not found. "
+                              << message};
     }
 
     return collection;
 }
 
 Status insertDocumentsSingleBatch(OperationContext* opCtx,
-                                  const NamespaceString& nss,
+                                  const NamespaceStringOrUUID& nsOrUUID,
                                   std::vector<InsertStatement>::const_iterator begin,
                                   std::vector<InsertStatement>::const_iterator end) {
-    AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+    AutoGetCollection autoColl(opCtx, nsOrUUID, MODE_IX);
 
     auto collectionResult =
-        getCollection(autoColl, nss, "The collection must exist before inserting documents.");
+        getCollection(autoColl, nsOrUUID, "The collection must exist before inserting documents.");
     if (!collectionResult.isOK()) {
         return collectionResult.getStatus();
     }
@@ -335,11 +337,11 @@ Status insertDocumentsSingleBatch(OperationContext* opCtx,
 }  // namespace
 
 Status StorageInterfaceImpl::insertDocuments(OperationContext* opCtx,
-                                             const NamespaceString& nss,
+                                             const NamespaceStringOrUUID& nsOrUUID,
                                              const std::vector<InsertStatement>& docs) {
     if (docs.size() > 1U) {
         try {
-            if (insertDocumentsSingleBatch(opCtx, nss, docs.cbegin(), docs.cend()).isOK()) {
+            if (insertDocumentsSingleBatch(opCtx, nsOrUUID, docs.cbegin(), docs.cend()).isOK()) {
                 return Status::OK();
             }
         } catch (...) {
@@ -350,9 +352,9 @@ Status StorageInterfaceImpl::insertDocuments(OperationContext* opCtx,
 
     // Try to insert the batch one-at-a-time because the batch failed all-at-once inserting.
     for (auto it = docs.cbegin(); it != docs.cend(); ++it) {
-        auto status =
-            writeConflictRetry(opCtx, "StorageInterfaceImpl::insertDocuments", nss.ns(), [&] {
-                auto status = insertDocumentsSingleBatch(opCtx, nss, it, it + 1);
+        auto status = writeConflictRetry(
+            opCtx, "StorageInterfaceImpl::insertDocuments", nsOrUUID.toString(), [&] {
+                auto status = insertDocumentsSingleBatch(opCtx, nsOrUUID, it, it + 1);
                 if (!status.isOK()) {
                     return status;
                 }
@@ -369,7 +371,7 @@ Status StorageInterfaceImpl::insertDocuments(OperationContext* opCtx,
 }
 
 Status StorageInterfaceImpl::dropReplicatedDatabases(OperationContext* opCtx) {
-    dropAllDatabasesExceptLocal(opCtx);
+    Database::dropAllDatabasesExceptLocal(opCtx);
     return Status::OK();
 }
 
@@ -398,6 +400,7 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
                                               const NamespaceString& nss,
                                               const CollectionOptions& options) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::createCollection", nss.ns(), [&] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_X);
         auto db = databaseWriteGuard.getDb();
         invariant(db);
@@ -420,6 +423,7 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
 
 Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::dropCollection", nss.ns(), [&] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDB(opCtx, nss.db(), MODE_X);
         if (!autoDB.getDb()) {
             // Database does not exist - nothing to do.
@@ -554,7 +558,7 @@ DeleteStageParams makeDeleteStageParamsForDeleteDocuments() {
 enum class FindDeleteMode { kFind, kDelete };
 StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
     OperationContext* opCtx,
-    const NamespaceString& nss,
+    const NamespaceStringOrUUID& nsOrUUID,
     boost::optional<StringData> indexName,
     StorageInterface::ScanDirection scanDirection,
     const BSONObj& startKey,
@@ -565,120 +569,130 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
     auto isFind = mode == FindDeleteMode::kFind;
     auto opStr = isFind ? "StorageInterfaceImpl::find" : "StorageInterfaceImpl::delete";
 
+    return writeConflictRetry(
+        opCtx, opStr, nsOrUUID.toString(), [&]() -> StatusWith<std::vector<BSONObj>> {
+            // We need to explicitly use this in a few places to help the type inference.  Use a
+            // shorthand.
+            using Result = StatusWith<std::vector<BSONObj>>;
 
-    return writeConflictRetry(opCtx, opStr, nss.ns(), [&] {
-        // We need to explicitly use this in a few places to help the type inference.  Use a
-        // shorthand.
-        using Result = StatusWith<std::vector<BSONObj>>;
+            auto collectionAccessMode = isFind ? MODE_IS : MODE_IX;
+            AutoGetCollection autoColl(opCtx, nsOrUUID, collectionAccessMode);
+            auto collectionResult = getCollection(
+                autoColl, nsOrUUID, str::stream() << "Unable to proceed with " << opStr << ".");
+            if (!collectionResult.isOK()) {
+                return Result(collectionResult.getStatus());
+            }
+            auto collection = collectionResult.getValue();
 
-        auto collectionAccessMode = isFind ? MODE_IS : MODE_IX;
-        AutoGetCollection autoColl(opCtx, nss, collectionAccessMode);
-        auto collectionResult = getCollection(
-            autoColl, nss, str::stream() << "Unable to proceed with " << opStr << ".");
-        if (!collectionResult.isOK()) {
-            return Result(collectionResult.getStatus());
-        }
-        auto collection = collectionResult.getValue();
+            auto isForward = scanDirection == StorageInterface::ScanDirection::kForward;
+            auto direction = isForward ? InternalPlanner::FORWARD : InternalPlanner::BACKWARD;
 
-        auto isForward = scanDirection == StorageInterface::ScanDirection::kForward;
-        auto direction = isForward ? InternalPlanner::FORWARD : InternalPlanner::BACKWARD;
-
-        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor;
-        if (!indexName) {
-            if (!startKey.isEmpty()) {
-                return Result(ErrorCodes::NoSuchKey,
-                              "non-empty startKey not allowed for collection scan");
-            }
-            if (boundInclusion != BoundInclusion::kIncludeStartKeyOnly) {
-                return Result(ErrorCodes::InvalidOptions,
-                              "bound inclusion must be BoundInclusion::kIncludeStartKeyOnly for "
-                              "collection scan");
-            }
-            // Use collection scan.
-            planExecutor = isFind
-                ? InternalPlanner::collectionScan(
-                      opCtx, nss.ns(), collection, PlanExecutor::NO_YIELD, direction)
-                : InternalPlanner::deleteWithCollectionScan(
-                      opCtx,
-                      collection,
-                      makeDeleteStageParamsForDeleteDocuments(),
-                      PlanExecutor::NO_YIELD,
-                      direction);
-        } else {
-            // Use index scan.
-            auto indexCatalog = collection->getIndexCatalog();
-            invariant(indexCatalog);
-            bool includeUnfinishedIndexes = false;
-            IndexDescriptor* indexDescriptor =
-                indexCatalog->findIndexByName(opCtx, *indexName, includeUnfinishedIndexes);
-            if (!indexDescriptor) {
-                return Result(ErrorCodes::IndexNotFound,
-                              str::stream() << "Index not found, ns:" << nss.ns() << ", index: "
-                                            << *indexName);
-            }
-            if (indexDescriptor->isPartial()) {
-                return Result(ErrorCodes::IndexOptionsConflict,
-                              str::stream()
-                                  << "Partial index is not allowed for this operation, ns:"
-                                  << nss.ns()
-                                  << ", index: "
-                                  << *indexName);
-            }
-
-            KeyPattern keyPattern(indexDescriptor->keyPattern());
-            auto minKey = Helpers::toKeyFormat(keyPattern.extendRangeBound({}, false));
-            auto maxKey = Helpers::toKeyFormat(keyPattern.extendRangeBound({}, true));
-            auto bounds =
-                isForward ? std::make_pair(minKey, maxKey) : std::make_pair(maxKey, minKey);
-            if (!startKey.isEmpty()) {
-                bounds.first = startKey;
-            }
-            if (!endKey.isEmpty()) {
-                bounds.second = endKey;
-            }
-            planExecutor = isFind
-                ? InternalPlanner::indexScan(opCtx,
-                                             collection,
-                                             indexDescriptor,
-                                             bounds.first,
-                                             bounds.second,
-                                             boundInclusion,
-                                             PlanExecutor::NO_YIELD,
-                                             direction,
-                                             InternalPlanner::IXSCAN_FETCH)
-                : InternalPlanner::deleteWithIndexScan(opCtx,
-                                                       collection,
-                                                       makeDeleteStageParamsForDeleteDocuments(),
-                                                       indexDescriptor,
-                                                       bounds.first,
-                                                       bounds.second,
-                                                       boundInclusion,
-                                                       PlanExecutor::NO_YIELD,
-                                                       direction);
-        }
-
-        std::vector<BSONObj> docs;
-        while (docs.size() < limit) {
-            BSONObj doc;
-            auto state = planExecutor->getNext(&doc, nullptr);
-            if (PlanExecutor::ADVANCED == state) {
-                docs.push_back(doc.getOwned());
+            std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor;
+            if (!indexName) {
+                if (!startKey.isEmpty()) {
+                    return Result(ErrorCodes::NoSuchKey,
+                                  "non-empty startKey not allowed for collection scan");
+                }
+                if (boundInclusion != BoundInclusion::kIncludeStartKeyOnly) {
+                    return Result(
+                        ErrorCodes::InvalidOptions,
+                        "bound inclusion must be BoundInclusion::kIncludeStartKeyOnly for "
+                        "collection scan");
+                }
+                // Use collection scan.
+                planExecutor = isFind
+                    ? InternalPlanner::collectionScan(
+                          opCtx, nsOrUUID.toString(), collection, PlanExecutor::NO_YIELD, direction)
+                    : InternalPlanner::deleteWithCollectionScan(
+                          opCtx,
+                          collection,
+                          makeDeleteStageParamsForDeleteDocuments(),
+                          PlanExecutor::NO_YIELD,
+                          direction);
             } else {
-                invariant(PlanExecutor::IS_EOF == state);
-                break;
+                // Use index scan.
+                auto indexCatalog = collection->getIndexCatalog();
+                invariant(indexCatalog);
+                bool includeUnfinishedIndexes = false;
+                IndexDescriptor* indexDescriptor =
+                    indexCatalog->findIndexByName(opCtx, *indexName, includeUnfinishedIndexes);
+                if (!indexDescriptor) {
+                    return Result(ErrorCodes::IndexNotFound,
+                                  str::stream() << "Index not found, ns:" << nsOrUUID.toString()
+                                                << ", index: "
+                                                << *indexName);
+                }
+                if (indexDescriptor->isPartial()) {
+                    return Result(ErrorCodes::IndexOptionsConflict,
+                                  str::stream()
+                                      << "Partial index is not allowed for this operation, ns:"
+                                      << nsOrUUID.toString()
+                                      << ", index: "
+                                      << *indexName);
+                }
+
+                KeyPattern keyPattern(indexDescriptor->keyPattern());
+                auto minKey = Helpers::toKeyFormat(keyPattern.extendRangeBound({}, false));
+                auto maxKey = Helpers::toKeyFormat(keyPattern.extendRangeBound({}, true));
+                auto bounds =
+                    isForward ? std::make_pair(minKey, maxKey) : std::make_pair(maxKey, minKey);
+                if (!startKey.isEmpty()) {
+                    bounds.first = startKey;
+                }
+                if (!endKey.isEmpty()) {
+                    bounds.second = endKey;
+                }
+                planExecutor = isFind ? InternalPlanner::indexScan(opCtx,
+                                                                   collection,
+                                                                   indexDescriptor,
+                                                                   bounds.first,
+                                                                   bounds.second,
+                                                                   boundInclusion,
+                                                                   PlanExecutor::NO_YIELD,
+                                                                   direction,
+                                                                   InternalPlanner::IXSCAN_FETCH)
+                                      : InternalPlanner::deleteWithIndexScan(
+                                            opCtx,
+                                            collection,
+                                            makeDeleteStageParamsForDeleteDocuments(),
+                                            indexDescriptor,
+                                            bounds.first,
+                                            bounds.second,
+                                            boundInclusion,
+                                            PlanExecutor::NO_YIELD,
+                                            direction);
             }
-        }
-        return Result(docs);
-    });
+
+            std::vector<BSONObj> docs;
+            BSONObj out;
+            PlanExecutor::ExecState state = PlanExecutor::ExecState::ADVANCED;
+            while (state == PlanExecutor::ExecState::ADVANCED && docs.size() < limit) {
+                state = planExecutor->getNext(&out, nullptr);
+                if (state == PlanExecutor::ExecState::ADVANCED) {
+                    docs.push_back(out.getOwned());
+                }
+            }
+
+            switch (state) {
+                case PlanExecutor::ADVANCED:
+                case PlanExecutor::IS_EOF:
+                    return Result(docs);
+                case PlanExecutor::FAILURE:
+                case PlanExecutor::DEAD:
+                    return WorkingSetCommon::getMemberObjectStatus(out);
+                default:
+                    MONGO_UNREACHABLE;
+            }
+        });
 }
 
 StatusWith<BSONObj> _findOrDeleteById(OperationContext* opCtx,
-                                      const NamespaceString& nss,
+                                      const NamespaceStringOrUUID& nsOrUUID,
                                       const BSONElement& idKey,
                                       FindDeleteMode mode) {
     auto wrappedIdKey = idKey.wrap("");
     auto result = _findOrDeleteDocuments(opCtx,
-                                         nss,
+                                         nsOrUUID,
                                          kIdIndexName,
                                          StorageInterface::ScanDirection::kForward,
                                          wrappedIdKey,
@@ -691,7 +705,9 @@ StatusWith<BSONObj> _findOrDeleteById(OperationContext* opCtx,
     }
     const auto& docs = result.getValue();
     if (docs.empty()) {
-        return {ErrorCodes::NoSuchKey, str::stream() << "No document found with _id: " << idKey};
+        return {ErrorCodes::NoSuchKey,
+                str::stream() << "No document found with _id: " << redact(idKey) << " in namespace "
+                              << nsOrUUID.toString()};
     }
 
     return docs.front();
@@ -763,15 +779,15 @@ StatusWith<BSONObj> StorageInterfaceImpl::findSingleton(OperationContext* opCtx,
 }
 
 StatusWith<BSONObj> StorageInterfaceImpl::findById(OperationContext* opCtx,
-                                                   const NamespaceString& nss,
+                                                   const NamespaceStringOrUUID& nsOrUUID,
                                                    const BSONElement& idKey) {
-    return _findOrDeleteById(opCtx, nss, idKey, FindDeleteMode::kFind);
+    return _findOrDeleteById(opCtx, nsOrUUID, idKey, FindDeleteMode::kFind);
 }
 
 StatusWith<BSONObj> StorageInterfaceImpl::deleteById(OperationContext* opCtx,
-                                                     const NamespaceString& nss,
+                                                     const NamespaceStringOrUUID& nsOrUUID,
                                                      const BSONElement& idKey) {
-    return _findOrDeleteById(opCtx, nss, idKey, FindDeleteMode::kDelete);
+    return _findOrDeleteById(opCtx, nsOrUUID, idKey, FindDeleteMode::kDelete);
 }
 
 namespace {
@@ -842,7 +858,7 @@ Status _updateWithQuery(OperationContext* opCtx,
 }  // namespace
 
 Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
-                                        const NamespaceString& nss,
+                                        const NamespaceStringOrUUID& nsOrUUID,
                                         const BSONElement& idKey,
                                         const BSONObj& update) {
     // Validate and construct an _id query for UpdateResult.
@@ -853,15 +869,24 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
     }
     auto query = queryResult.getValue();
 
-    UpdateRequest request(nss);
-    request.setQuery(query);
-    request.setUpdates(update);
-    request.setUpsert(true);
-    invariant(!request.isMulti());  // This follows from using an exact _id query.
-    invariant(!request.shouldReturnAnyDocs());
-    invariant(PlanExecutor::NO_YIELD == request.getYieldPolicy());
+    return writeConflictRetry(opCtx, "StorageInterfaceImpl::upsertById", nsOrUUID.toString(), [&] {
+        AutoGetCollection autoColl(opCtx, nsOrUUID, MODE_IX);
+        auto collectionResult = getCollection(autoColl, nsOrUUID, "Unable to update document.");
+        if (!collectionResult.isOK()) {
+            return collectionResult.getStatus();
+        }
+        auto collection = collectionResult.getValue();
 
-    return writeConflictRetry(opCtx, "StorageInterfaceImpl::upsertById", nss.ns(), [&] {
+        // We can create an UpdateRequest now that the collection's namespace has been resolved, in
+        // the event it was specified as a UUID.
+        UpdateRequest request(collection->ns());
+        request.setQuery(query);
+        request.setUpdates(update);
+        request.setUpsert(true);
+        invariant(!request.isMulti());  // This follows from using an exact _id query.
+        invariant(!request.shouldReturnAnyDocs());
+        invariant(PlanExecutor::NO_YIELD == request.getYieldPolicy());
+
         // ParsedUpdate needs to be inside the write conflict retry loop because it contains
         // the UpdateDriver whose state may be modified while we are applying the update.
         ParsedUpdate parsedUpdate(opCtx, &request);
@@ -869,13 +894,6 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
         if (!parsedUpdateStatus.isOK()) {
             return parsedUpdateStatus;
         }
-
-        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-        auto collectionResult = getCollection(autoColl, nss, "Unable to update document.");
-        if (!collectionResult.isOK()) {
-            return collectionResult.getStatus();
-        }
-        auto collection = collectionResult.getValue();
 
         // We're using the ID hack to perform the update so we have to disallow collections
         // without an _id index.
@@ -978,17 +996,37 @@ StatusWith<StorageInterface::CollectionSize> StorageInterfaceImpl::getCollection
 }
 
 StatusWith<StorageInterface::CollectionCount> StorageInterfaceImpl::getCollectionCount(
-    OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollectionForRead autoColl(opCtx, nss);
+    OperationContext* opCtx, const NamespaceStringOrUUID& nsOrUUID) {
+    AutoGetCollectionForRead autoColl(opCtx, nsOrUUID);
 
     auto collectionResult =
-        getCollection(autoColl, nss, "Unable to get number of documents in collection.");
+        getCollection(autoColl, nsOrUUID, "Unable to get number of documents in collection.");
     if (!collectionResult.isOK()) {
         return collectionResult.getStatus();
     }
     auto collection = collectionResult.getValue();
 
     return collection->numRecords(opCtx);
+}
+
+Status StorageInterfaceImpl::setCollectionCount(OperationContext* opCtx,
+                                                const NamespaceStringOrUUID& nsOrUUID,
+                                                long long newCount) {
+    AutoGetCollection autoColl(opCtx, nsOrUUID, LockMode::MODE_X);
+
+    auto collectionResult =
+        getCollection(autoColl, nsOrUUID, "Unable to set number of documents in collection.");
+    if (!collectionResult.isOK()) {
+        return collectionResult.getStatus();
+    }
+    auto collection = collectionResult.getValue();
+
+    auto rs = collection->getRecordStore();
+    // We cannot fix the data size correctly, so we just get the current cached value and keep it
+    // the same.
+    long long dataSize = rs->dataSize(opCtx);
+    rs->updateStatsAfterRepair(opCtx, newCount, dataSize);
+    return Status::OK();
 }
 
 StatusWith<OptionalCollectionUUID> StorageInterfaceImpl::getCollectionUUID(
@@ -1004,21 +1042,30 @@ StatusWith<OptionalCollectionUUID> StorageInterfaceImpl::getCollectionUUID(
     return collection->uuid();
 }
 
-Status StorageInterfaceImpl::upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) {
-    return updateUUIDSchemaVersionNonReplicated(opCtx, true);
+Status StorageInterfaceImpl::upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) {
+    return updateNonReplicatedUniqueIndexes(opCtx);
 }
 
 void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
-    serviceCtx->getGlobalStorageEngine()->setStableTimestamp(snapshotName);
+    serviceCtx->getStorageEngine()->setStableTimestamp(snapshotName);
 }
 
 void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
                                                    Timestamp snapshotName) {
-    serviceCtx->getGlobalStorageEngine()->setInitialDataTimestamp(snapshotName);
+    serviceCtx->getStorageEngine()->setInitialDataTimestamp(snapshotName);
 }
 
-Status StorageInterfaceImpl::recoverToStableTimestamp(ServiceContext* serviceCtx) {
-    return serviceCtx->getGlobalStorageEngine()->recoverToStableTimestamp();
+StatusWith<Timestamp> StorageInterfaceImpl::recoverToStableTimestamp(OperationContext* opCtx) {
+    return opCtx->getServiceContext()->getStorageEngine()->recoverToStableTimestamp(opCtx);
+}
+
+bool StorageInterfaceImpl::supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const {
+    return serviceCtx->getStorageEngine()->supportsRecoverToStableTimestamp();
+}
+
+boost::optional<Timestamp> StorageInterfaceImpl::getRecoveryTimestamp(
+    ServiceContext* serviceCtx) const {
+    return serviceCtx->getStorageEngine()->getRecoveryTimestamp();
 }
 
 Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
@@ -1081,6 +1128,37 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
 void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) {
     AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
     oplog.getCollection()->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
+}
+
+void StorageInterfaceImpl::oplogDiskLocRegister(OperationContext* opCtx,
+                                                const Timestamp& ts,
+                                                bool orderedCommit) {
+    AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
+    fassert(
+        28557,
+        oplog.getCollection()->getRecordStore()->oplogDiskLocRegister(opCtx, ts, orderedCommit));
+}
+
+boost::optional<Timestamp> StorageInterfaceImpl::getLastStableCheckpointTimestamp(
+    ServiceContext* serviceCtx) const {
+    if (!supportsRecoverToStableTimestamp(serviceCtx)) {
+        return boost::none;
+    }
+
+    const auto ret = serviceCtx->getStorageEngine()->getLastStableCheckpointTimestamp();
+    if (ret == boost::none) {
+        return Timestamp::min();
+    }
+
+    return ret;
+}
+
+bool StorageInterfaceImpl::supportsDocLocking(ServiceContext* serviceCtx) const {
+    return serviceCtx->getStorageEngine()->supportsDocLocking();
+}
+
+Timestamp StorageInterfaceImpl::getAllCommittedTimestamp(ServiceContext* serviceCtx) const {
+    return serviceCtx->getStorageEngine()->getAllCommittedTimestamp();
 }
 
 }  // namespace repl

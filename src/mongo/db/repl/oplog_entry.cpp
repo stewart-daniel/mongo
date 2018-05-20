@@ -87,6 +87,7 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
                           const BSONObj& oField,
                           const boost::optional<BSONObj>& o2Field,
                           const OperationSessionInfo& sessionInfo,
+                          const boost::optional<bool>& isUpsert,
                           const boost::optional<mongo::Date_t>& wallClockTime,
                           const boost::optional<StmtId>& statementId,
                           const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
@@ -109,6 +110,10 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
     builder.append(OplogEntryBase::kObjectFieldName, oField);
     if (o2Field) {
         builder.append(OplogEntryBase::kObject2FieldName, o2Field.get());
+    }
+    if (isUpsert) {
+        invariant(o2Field);
+        builder.append(OplogEntryBase::kUpsertFieldName, isUpsert.get());
     }
     if (wallClockTime) {
         builder.append(OplogEntryBase::kWallClockTimeFieldName, wallClockTime.get());
@@ -143,7 +148,7 @@ ReplOperation OplogEntry::makeInsertOperation(const NamespaceString& nss,
     op.setOpType(OpTypeEnum::kInsert);
     op.setNamespace(nss);
     op.setUuid(uuid);
-    op.setObject(docToInsert);
+    op.setObject(docToInsert.getOwned());
     return op;
 }
 
@@ -155,8 +160,8 @@ ReplOperation OplogEntry::makeUpdateOperation(const NamespaceString nss,
     op.setOpType(OpTypeEnum::kUpdate);
     op.setNamespace(nss);
     op.setUuid(uuid);
-    op.setObject(update);
-    op.setObject2(criteria);
+    op.setObject(update.getOwned());
+    op.setObject2(criteria.getOwned());
     return op;
 }
 
@@ -167,8 +172,13 @@ ReplOperation OplogEntry::makeDeleteOperation(const NamespaceString& nss,
     op.setOpType(OpTypeEnum::kDelete);
     op.setNamespace(nss);
     op.setUuid(uuid);
-    op.setObject(docToDelete);
+    op.setObject(docToDelete.getOwned());
     return op;
+}
+
+size_t OplogEntry::getReplOperationSize(const ReplOperation& op) {
+    return sizeof(op) + op.getNamespace().size() + op.getObject().objsize() +
+        (op.getObject2() ? op.getObject2()->objsize() : 0);
 }
 
 StatusWith<OplogEntry> OplogEntry::parse(const BSONObj& object) {
@@ -202,6 +212,7 @@ OplogEntry::OplogEntry(OpTime opTime,
                        const BSONObj& oField,
                        const boost::optional<BSONObj>& o2Field,
                        const OperationSessionInfo& sessionInfo,
+                       const boost::optional<bool>& isUpsert,
                        const boost::optional<mongo::Date_t>& wallClockTime,
                        const boost::optional<StmtId>& statementId,
                        const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
@@ -217,6 +228,7 @@ OplogEntry::OplogEntry(OpTime opTime,
                                    oField,
                                    o2Field,
                                    sessionInfo,
+                                   isUpsert,
                                    wallClockTime,
                                    statementId,
                                    prevWriteOpTimeInTransaction,
@@ -227,8 +239,9 @@ bool OplogEntry::isCommand() const {
     return getOpType() == OpTypeEnum::kCommand;
 }
 
-bool OplogEntry::isCrudOpType() const {
-    switch (getOpType()) {
+// static
+bool OplogEntry::isCrudOpType(OpTypeEnum opType) {
+    switch (opType) {
         case OpTypeEnum::kInsert:
         case OpTypeEnum::kDelete:
         case OpTypeEnum::kUpdate:
@@ -238,6 +251,10 @@ bool OplogEntry::isCrudOpType() const {
             return false;
     }
     MONGO_UNREACHABLE;
+}
+
+bool OplogEntry::isCrudOpType() const {
+    return isCrudOpType(getOpType());
 }
 
 BSONElement OplogEntry::getIdElement() const {
@@ -287,6 +304,10 @@ std::string OplogEntry::toString() const {
 
 std::ostream& operator<<(std::ostream& s, const OplogEntry& o) {
     return s << o.toString();
+}
+
+std::ostream& operator<<(std::ostream& s, const ReplOperation& o) {
+    return s << o.toBSON().toString();
 }
 
 }  // namespace repl

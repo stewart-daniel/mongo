@@ -41,6 +41,7 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -129,6 +130,20 @@ void ShardRemote::updateReplSetMonitor(const HostAndPort& remoteHost,
     }
 }
 
+void ShardRemote::updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) {
+    stdx::lock_guard<stdx::mutex> lk(_lastCommittedOpTimeMutex);
+
+    // A secondary may return a lastCommittedOpTime less than the latest seen so far.
+    if (lastCommittedOpTime > _lastCommittedOpTime) {
+        _lastCommittedOpTime = lastCommittedOpTime;
+    }
+}
+
+LogicalTime ShardRemote::getLastCommittedOpTime() const {
+    stdx::lock_guard<stdx::mutex> lk(_lastCommittedOpTimeMutex);
+    return _lastCommittedOpTime;
+}
+
 std::string ShardRemote::toString() const {
     return getId().toString() + ":" + _originalConnString.toString();
 }
@@ -167,8 +182,8 @@ StatusWith<Shard::CommandResponse> ShardRemote::_runCommand(OperationContext* op
                                                             const BSONObj& cmdObj) {
 
     ReadPreferenceSetting readPrefWithMinOpTime(readPref);
-    if (getId() == "config") {
-        readPrefWithMinOpTime.minOpTime = grid.configOpTime();
+    if (isConfig()) {
+        readPrefWithMinOpTime.minOpTime = Grid::get(opCtx)->configOpTime();
     }
     const auto swHost = _targeter->findHost(opCtx, readPrefWithMinOpTime);
     if (!swHost.isOK()) {
@@ -232,9 +247,11 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     const BSONObj& query,
     const BSONObj& sort,
     boost::optional<long long> limit) {
-    invariant(getId() == "config");
+    invariant(isConfig());
+    auto const grid = Grid::get(opCtx);
+
     ReadPreferenceSetting readPrefWithMinOpTime(readPref);
-    readPrefWithMinOpTime.minOpTime = grid.configOpTime();
+    readPrefWithMinOpTime.minOpTime = grid->configOpTime();
 
     const auto host = _targeter->findHost(opCtx, readPrefWithMinOpTime);
     if (!host.isOK()) {
@@ -288,7 +305,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     BSONObj readConcernObj;
     {
         invariant(readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern);
-        const repl::ReadConcernArgs readConcern{grid.configOpTime(), readConcernLevel};
+        const repl::ReadConcernArgs readConcern(grid->configOpTime(), readConcernLevel);
         BSONObjBuilder bob;
         readConcern.appendInfo(&bob);
         readConcernObj =

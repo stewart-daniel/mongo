@@ -48,25 +48,24 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-namespace {
-MONGO_INITIALIZER(InitializeIndexCatalogEntryFactory)(InitializerContext* const) {
-    IndexCatalogEntry::registerFactory([](IndexCatalogEntry* const this_,
-                                          OperationContext* const opCtx,
-                                          const StringData ns,
-                                          CollectionCatalogEntry* const collection,
-                                          std::unique_ptr<IndexDescriptor> descriptor,
-                                          CollectionInfoCache* const infoCache) {
-        return stdx::make_unique<IndexCatalogEntryImpl>(
-            this_, opCtx, ns, collection, std::move(descriptor), infoCache);
-    });
-    return Status::OK();
+MONGO_REGISTER_SHIM(IndexCatalogEntry::makeImpl)
+(IndexCatalogEntry* const this_,
+ OperationContext* const opCtx,
+ const StringData ns,
+ CollectionCatalogEntry* const collection,
+ std::unique_ptr<IndexDescriptor> descriptor,
+ CollectionInfoCache* const infoCache,
+ PrivateTo<IndexCatalogEntry>)
+    ->std::unique_ptr<IndexCatalogEntry::Impl> {
+    return std::make_unique<IndexCatalogEntryImpl>(
+        this_, opCtx, ns, collection, std::move(descriptor), infoCache);
 }
-}  // namespace
 
 using std::string;
 
@@ -120,7 +119,7 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(IndexCatalogEntry* const this_,
             CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation);
 
         // Index spec should have already been validated.
-        invariantOK(statusWithCollator.getStatus());
+        invariant(statusWithCollator.getStatus());
 
         _collator = std::move(statusWithCollator.getValue());
     }
@@ -132,15 +131,13 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(IndexCatalogEntry* const this_,
             new ExpressionContext(opCtx, _collator.get()));
 
         // Parsing the partial filter expression is not expected to fail here since the
-        // expression would have been successfully parsed upstream during index creation. However,
-        // filters that were allowed in partial filter expressions prior to 3.6 may be present in
-        // the index catalog and must also successfully parse.
+        // expression would have been successfully parsed upstream during index creation.
         StatusWithMatchExpression statusWithMatcher =
             MatchExpressionParser::parse(filter,
                                          std::move(expCtx),
                                          ExtensionsCallbackNoop(),
-                                         MatchExpressionParser::AllowedFeatures::kIsolated);
-        invariantOK(statusWithMatcher.getStatus());
+                                         MatchExpressionParser::kBanAllSpecialFeatures);
+        invariant(statusWithMatcher.getStatus());
         _filterExpression = std::move(statusWithMatcher.getValue());
         LOG(2) << "have filter expression for " << _ns << " " << _descriptor->indexName() << " "
                << redact(filter);
@@ -169,13 +166,49 @@ bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
     return _isReady;
 }
 
-bool IndexCatalogEntryImpl::isMultikey() const {
-    return _isMultikey.load();
+bool IndexCatalogEntryImpl::isMultikey(OperationContext* opCtx) const {
+    auto ret = _isMultikey.load();
+    if (ret) {
+        return true;
+    }
+
+    // Multikey updates are only persisted, to disk and in memory, when the transaction
+    // commits. In the case of multi-statement transactions, a client attempting to read their own
+    // transactions writes can return wrong results if their writes include multikey changes.
+    //
+    // To accomplish this, the write-path will persist multikey changes on the `Session` object
+    // and the read-path will query this state before determining there is no interesting multikey
+    // state. Note, it's always legal, though potentially wasteful, to return `true`.
+    auto session = OperationContextSession::get(opCtx);
+    if (!session || !session->inMultiDocumentTransaction()) {
+        return false;
+    }
+
+    for (const MultikeyPathInfo& path : session->getMultikeyPathInfo()) {
+        if (path.nss == NamespaceString(_ns) && path.indexName == _descriptor->indexName()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 MultikeyPaths IndexCatalogEntryImpl::getMultikeyPaths(OperationContext* opCtx) const {
     stdx::lock_guard<stdx::mutex> lk(_indexMultikeyPathsMutex);
-    return _indexMultikeyPaths;
+
+    auto session = OperationContextSession::get(opCtx);
+    if (!session || !session->inMultiDocumentTransaction()) {
+        return _indexMultikeyPaths;
+    }
+
+    MultikeyPaths ret = _indexMultikeyPaths;
+    for (const MultikeyPathInfo& path : session->getMultikeyPathInfo()) {
+        if (path.nss == NamespaceString(_ns) && path.indexName == _descriptor->indexName()) {
+            MultikeyPathTracker::mergeMultikeyPaths(&ret, path.multikeyPaths);
+        }
+    }
+
+    return ret;
 }
 
 // ---
@@ -188,7 +221,7 @@ class IndexCatalogEntryImpl::SetHeadChange : public RecoveryUnit::Change {
 public:
     SetHeadChange(IndexCatalogEntryImpl* ice, RecordId oldHead) : _ice(ice), _oldHead(oldHead) {}
 
-    virtual void commit() {}
+    virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
         _ice->_head = _oldHead;
     }
@@ -206,7 +239,7 @@ void IndexCatalogEntryImpl::setHead(OperationContext* opCtx, RecordId newHead) {
 
 void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
                                         const MultikeyPaths& multikeyPaths) {
-    if (!_indexTracksPathLevelMultikeyInfo && isMultikey()) {
+    if (!_indexTracksPathLevelMultikeyInfo && isMultikey(opCtx)) {
         // If the index is already set as multikey and we don't have any path-level information to
         // update, then there's nothing more for us to do.
         return;
@@ -277,22 +310,33 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
 
     // When the recovery unit commits, update the multikey paths if needed and clear the plan cache
     // if the index metadata has changed.
-    opCtx->recoveryUnit()->onCommit([this, multikeyPaths, indexMetadataHasChanged] {
-        _isMultikey.store(true);
+    opCtx->recoveryUnit()->onCommit(
+        [this, multikeyPaths, indexMetadataHasChanged](boost::optional<Timestamp>) {
+            _isMultikey.store(true);
 
-        if (_indexTracksPathLevelMultikeyInfo) {
-            stdx::lock_guard<stdx::mutex> lk(_indexMultikeyPathsMutex);
-            for (size_t i = 0; i < multikeyPaths.size(); ++i) {
-                _indexMultikeyPaths[i].insert(multikeyPaths[i].begin(), multikeyPaths[i].end());
+            if (_indexTracksPathLevelMultikeyInfo) {
+                stdx::lock_guard<stdx::mutex> lk(_indexMultikeyPathsMutex);
+                for (size_t i = 0; i < multikeyPaths.size(); ++i) {
+                    _indexMultikeyPaths[i].insert(multikeyPaths[i].begin(), multikeyPaths[i].end());
+                }
             }
-        }
 
-        if (indexMetadataHasChanged && _infoCache) {
-            LOG(1) << _ns << ": clearing plan cache - index " << _descriptor->keyPattern()
-                   << " set to multi key.";
-            _infoCache->clearQueryCache();
-        }
-    });
+            if (indexMetadataHasChanged && _infoCache) {
+                LOG(1) << _ns << ": clearing plan cache - index " << _descriptor->keyPattern()
+                       << " set to multi key.";
+                _infoCache->clearQueryCache();
+            }
+        });
+
+    // Keep multikey changes in memory to correctly service later reads using this index.
+    auto session = OperationContextSession::get(opCtx);
+    if (session && session->inMultiDocumentTransaction()) {
+        MultikeyPathInfo info;
+        info.nss = _collection->ns();
+        info.indexName = _descriptor->indexName();
+        info.multikeyPaths = paths;
+        session->addMultikeyPathInfo(std::move(info));
+    }
 }
 
 // ----

@@ -320,9 +320,14 @@ __wt_conn_dhandle_close(
 		 * We can't discard non-durable trees yet: first we have to
 		 * close the underlying btree handle, then we can mark the
 		 * data handle dead.
+		 *
+		 * If we are closing with timestamps enforced, then we have
+		 * already checkpointed as of the timestamp as needed and any
+		 * remaining dirty data should be discarded.
 		 */
 		if (!discard && !marked_dead) {
-			if (F_ISSET(conn, WT_CONN_IN_MEMORY) ||
+			if (F_ISSET(conn, WT_CONN_CLOSING_TIMESTAMP) ||
+			    F_ISSET(conn, WT_CONN_IN_MEMORY) ||
 			    F_ISSET(btree, WT_BTREE_NO_CHECKPOINT))
 				discard = true;
 			else {
@@ -785,7 +790,8 @@ __wt_conn_dhandle_discard(WT_SESSION_IMPL *session)
 restart:
 	TAILQ_FOREACH(dhandle, &conn->dhqh, q) {
 		if (WT_IS_METADATA(dhandle) ||
-		    strcmp(dhandle->name, WT_LAS_URI) == 0)
+		    strcmp(dhandle->name, WT_LAS_URI) == 0 ||
+		    WT_PREFIX_MATCH(dhandle->name, WT_SYSTEM_PREFIX))
 			continue;
 
 		WT_WITH_DHANDLE(session, dhandle,

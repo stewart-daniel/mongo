@@ -61,6 +61,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/session_killer.h"
 #include "mongo/db/startup_warnings_common.h"
 #include "mongo/db/wire_version.h"
@@ -75,6 +76,7 @@
 #include "mongo/s/client/shard_remote.h"
 #include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/commands/kill_sessions_remote.h"
+#include "mongo/s/committed_optime_metadata_hook.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
@@ -98,9 +100,8 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/message.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_exception.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
@@ -297,6 +298,8 @@ Status initializeSharding(OperationContext* opCtx) {
             auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
             hookList->addHook(
                 stdx::make_unique<rpc::LogicalTimeMetadataHook>(opCtx->getServiceContext()));
+            hookList->addHook(
+                stdx::make_unique<rpc::CommittedOpTimeMetadataHook>(opCtx->getServiceContext()));
             hookList->addHook(stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(
                 opCtx->getServiceContext()));
             return hookList;
@@ -316,6 +319,8 @@ Status initializeSharding(OperationContext* opCtx) {
     if (!status.isOK()) {
         return status;
     }
+
+    Grid::get(opCtx)->setShardingInitialized();
 
     return Status::OK();
 }
@@ -353,6 +358,10 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     unshardedHookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
     unshardedHookList->addHook(
         stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
+    // TODO SERVER-33053: readReplyMetadata is not called on hooks added through
+    // ShardingConnectionHook with _shardedConnections=false, so this hook will not run for
+    // connections using globalConnPool.
+    unshardedHookList->addHook(stdx::make_unique<rpc::CommittedOpTimeMetadataHook>(serviceContext));
 
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
     globalConnPool.addHook(new ShardingConnectionHook(false, std::move(unshardedHookList)));
@@ -361,6 +370,7 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     shardedHookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
     shardedHookList->addHook(
         stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
+    shardedHookList->addHook(stdx::make_unique<rpc::CommittedOpTimeMetadataHook>(serviceContext));
 
     shardConnectionPool.addHook(new ShardingConnectionHook(true, std::move(shardedHookList)));
 
@@ -424,8 +434,8 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     PeriodicTask::startRunningPeriodicTasks();
 
     // Set up the periodic runner for background job execution
-    auto runner = makePeriodicRunner();
-    runner->startup().transitional_ignore();
+    auto runner = makePeriodicRunner(serviceContext);
+    runner->startup();
     serviceContext->setPeriodicRunner(std::move(runner));
 
     SessionKiller::set(serviceContext,
@@ -518,6 +528,7 @@ ExitCode main(ServiceContext* serviceContext) {
     return runMongosServer(serviceContext);
 }
 
+namespace {
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     forkServerOrDie();
@@ -536,18 +547,13 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion40, ("EndStar
     return Status::OK();
 }
 
-MONGO_INITIALIZER(CreateAuthorizationExternalStateFactory)(InitializerContext* context) {
-    AuthzManagerExternalState::create = &createAuthzManagerExternalStateMongos;
-    return Status::OK();
-}
-
-MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
-    getGlobalServiceContext()->setTickSource(stdx::make_unique<SystemTickSource>());
-    getGlobalServiceContext()->setFastClockSource(stdx::make_unique<SystemClockSource>());
-    getGlobalServiceContext()->setPreciseClockSource(stdx::make_unique<SystemClockSource>());
-    return Status::OK();
-}
+ServiceContextRegistrar serviceContextCreator([]() {
+    auto service = std::make_unique<ServiceContextNoop>();
+    service->setTickSource(std::make_unique<SystemTickSource>());
+    service->setFastClockSource(std::make_unique<SystemClockSource>());
+    service->setPreciseClockSource(std::make_unique<SystemClockSource>());
+    return service;
+});
 
 #ifdef MONGO_CONFIG_SSL
 MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManager"))
@@ -601,6 +607,7 @@ ExitCode mongoSMain(int argc, char* argv[], char** envp) {
     }
 }
 
+}  // namespace
 }  // namespace mongo
 
 #if defined(_WIN32)

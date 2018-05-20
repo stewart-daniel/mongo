@@ -45,11 +45,15 @@
     assert.commandWorked(st.shard1.getDB('admin').runCommand(
         {configureFailPoint: 'doNotRefreshRecipientAfterCommit', mode: 'alwaysOn'}));
 
+    // Turn off automatic shard refresh in mongos when a stale config error is thrown.
+    assert.commandWorked(mongosForAgg.getDB('admin').runCommand(
+        {configureFailPoint: 'doNotRefreshShardsOnRetargettingError', mode: 'alwaysOn'}));
+
     assert.commandWorked(mongosDB.dropDatabase());
 
-    // Enable sharding on the test DB and ensure its primary is shard0000.
+    // Enable sharding on the test DB and ensure its primary is st.shard0.shardName.
     assert.commandWorked(mongosDB.adminCommand({enableSharding: mongosDB.getName()}));
-    st.ensurePrimaryShard(mongosDB.getName(), "shard0000");
+    st.ensurePrimaryShard(mongosDB.getName(), st.shard0.shardName);
 
     // Shard the test collection on _id.
     assert.commandWorked(
@@ -63,11 +67,11 @@
     assert.commandWorked(
         mongosDB.adminCommand({split: mongosColl.getFullName(), middle: {_id: 100}}));
 
-    // Move the [0, 100) and [100, MaxKey) chunks to shard0001.
+    // Move the [0, 100) and [100, MaxKey) chunks to st.shard1.shardName.
     assert.commandWorked(mongosDB.adminCommand(
-        {moveChunk: mongosColl.getFullName(), find: {_id: 50}, to: "shard0001"}));
+        {moveChunk: mongosColl.getFullName(), find: {_id: 50}, to: st.shard1.shardName}));
     assert.commandWorked(mongosDB.adminCommand(
-        {moveChunk: mongosColl.getFullName(), find: {_id: 150}, to: "shard0001"}));
+        {moveChunk: mongosColl.getFullName(), find: {_id: 150}, to: st.shard1.shardName}));
 
     // Write one document into each of the chunks.
     assert.writeOK(mongosColl.insert({_id: -150}));
@@ -96,7 +100,7 @@
         let testName, outColl;
 
         // Test that a range query is passed through if the chunks encompassed by the query all lie
-        // on a single shard, in this case shard0000.
+        // on a single shard, in this case st.shard0.shardName.
         testName = "agg_shard_targeting_range_single_shard_all_chunks_on_same_shard";
         assert.eq(mongosColl
                       .aggregate([{$match: {_id: {$gte: -150, $lte: -50}}}].concat(splitPoint),
@@ -162,14 +166,18 @@
 
         // Test that a passthrough will back out and split the pipeline if we try to target a single
         // shard, get a stale config exception, and find that more than one shard is now involved.
-        // Move the _id: [-100, 0) chunk from shard0000 to shard0001 via mongosForMove.
-        assert.commandWorked(mongosForMove.getDB("admin").runCommand(
-            {moveChunk: mongosColl.getFullName(), find: {_id: -50}, to: "shard0001"}));
+        // Move the _id: [-100, 0) chunk from st.shard0.shardName to st.shard1.shardName via
+        // mongosForMove.
+        assert.commandWorked(mongosForMove.getDB("admin").runCommand({
+            moveChunk: mongosColl.getFullName(),
+            find: {_id: -50},
+            to: st.shard1.shardName,
+        }));
 
         // Run the same aggregation that targeted a single shard via the now-stale mongoS. It should
-        // attempt to send the aggregation to shard0000, hit a stale config exception, split the
-        // pipeline and redispatch. We append an $_internalSplitPipeline stage in order to force a
-        // shard merge rather than a mongoS merge.
+        // attempt to send the aggregation to st.shard0.shardName, hit a stale config exception,
+        // split the pipeline and redispatch. We append an $_internalSplitPipeline stage in order to
+        // force a shard merge rather than a mongoS merge.
         testName = "agg_shard_targeting_backout_passthrough_and_split_if_cache_is_stale";
         assert.eq(mongosColl
                       .aggregate([{$match: {_id: {$gte: -150, $lte: -50}}}]
@@ -180,23 +188,23 @@
                   2);
 
         // Before the first dispatch:
-        // - mongosForMove and shard0000 (the donor shard) are up to date.
-        // - mongosForAgg and shard0001 are stale. mongosForAgg incorrectly believes that the
-        // necessary data is all on shard0000.
+        // - mongosForMove and st.shard0.shardName (the donor shard) are up to date.
+        // - mongosForAgg and st.shard1.shardName are stale. mongosForAgg incorrectly believes that
+        //   the necessary data is all on st.shard0.shardName.
+        //
         // We therefore expect that:
         // - mongosForAgg will throw a stale config error when it attempts to establish a
-        // single-shard cursor on shard0000 (attempt 1).
-        // - mongosForAgg will back out, refresh itself, split the pipeline and redispatch to both
-        // shards.
-        // - shard0001 will throw a stale config and refresh itself when the split pipeline is sent
-        // to it (attempt 2).
-        // - mongosForAgg will back out, retain the split pipeline and redispatch (attempt 3).
+        // single-shard cursor on st.shard0.shardName (attempt 1).
+        // - mongosForAgg will back out, refresh itself, and redispatch to both shards.
+        // - st.shard1.shardName will throw a stale config and refresh itself when the split
+        // pipeline is sent to it (attempt 2).
+        // - mongosForAgg will back out and redispatch (attempt 3).
         // - The aggregation will succeed on the third dispatch.
 
         // We confirm this behaviour via the following profiler results:
 
-        // - One aggregation on shard0000 with a shard version exception (indicating that the mongoS
-        // was stale).
+        // - One aggregation on st.shard0.shardName with a shard version exception (indicating that
+        // the mongoS was stale).
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: shard0DB,
             filter: {
@@ -207,8 +215,8 @@
             }
         });
 
-        // - One aggregation on shard0001 with a shard version exception (indicating that the shard
-        // was stale).
+        // - One aggregation on st.shard1.shardName with a shard version exception (indicating that
+        // the shard was stale).
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: shard1DB,
             filter: {
@@ -219,10 +227,10 @@
             }
         });
 
-        // - At most two aggregations on shard0000 with no stale config exceptions. The first, if
-        // present, is an aborted cursor created if the command reaches shard0000 before shard0001
-        // throws its stale config exception during attempt 2. The second profiler entry is from the
-        // aggregation which succeeded.
+        // - At most two aggregations on st.shard0.shardName with no stale config exceptions. The
+        // first, if present, is an aborted cursor created if the command reaches
+        // st.shard0.shardName before st.shard1.shardName throws its stale config exception during
+        // attempt 2. The second profiler entry is from the aggregation which succeeded.
         profilerHasAtLeastOneAtMostNumMatchingEntriesOrThrow({
             profileDB: shard0DB,
             filter: {
@@ -234,7 +242,7 @@
             maxExpectedMatches: 2
         });
 
-        // - One aggregation on shard0001 with no stale config exception.
+        // - One aggregation on st.shard1.shardName with no stale config exception.
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: shard1DB,
             filter: {
@@ -245,8 +253,8 @@
             }
         });
 
-        // - One $mergeCursors aggregation on primary shard0000, since we eventually target both
-        // shards after backing out the passthrough and splitting the pipeline.
+        // - One $mergeCursors aggregation on primary st.shard0.shardName, since we eventually
+        // target both shards after backing out the passthrough and splitting the pipeline.
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: primaryShardDB,
             filter: {
@@ -256,12 +264,14 @@
             }
         });
 
-        // Test that a split pipeline will back out and reassemble the pipeline if we target
-        // multiple shards, get a stale config exception, and find that we can now target a single
-        // shard.
-        // Move the _id: [-100, 0) chunk back from shard0001 to shard0000 via mongosForMove.
-        assert.commandWorked(mongosForMove.getDB("admin").runCommand(
-            {moveChunk: mongosColl.getFullName(), find: {_id: -50}, to: "shard0000"}));
+        // Move the _id: [-100, 0) chunk back from st.shard1.shardName to st.shard0.shardName via
+        // mongosForMove. Shard0 and mongosForAgg are now stale.
+        assert.commandWorked(mongosForMove.getDB("admin").runCommand({
+            moveChunk: mongosColl.getFullName(),
+            find: {_id: -50},
+            to: st.shard0.shardName,
+            _waitForDelete: true
+        }));
 
         // Run the same aggregation via the now-stale mongoS. It should split the pipeline, hit a
         // stale config exception, and reset to the original single-shard pipeline upon refresh. We
@@ -277,24 +287,23 @@
                   2);
 
         // Before the first dispatch:
-        // - mongosForMove and shard0001 (the donor shard) are up to date.
-        // - mongosForAgg and shard0000 are stale. mongosForAgg incorrectly believes that the
-        // necessary data is spread across both shards.
+        // - mongosForMove and st.shard1.shardName (the donor shard) are up to date.
+        // - mongosForAgg and st.shard0.shardName are stale. mongosForAgg incorrectly believes that
+        // the necessary data is spread across both shards.
+        //
         // We therefore expect that:
         // - mongosForAgg will throw a stale config error when it attempts to establish a cursor on
-        // shard0001 (attempt 1).
-        // - mongosForAgg will back out, refresh itself, coalesce the split pipeline into a single
-        // pipeline and redispatch to shard0000.
-        // - shard0000 will throw a stale config and refresh itself when the pipeline is sent to it
-        // (attempt 2).
-        // - mongosForAgg will back out, retain the single-shard pipeline and redispatch (attempt
-        // 3).
+        // st.shard1.shardName (attempt 1).
+        // - mongosForAgg will back out, refresh itself, and redispatch to st.shard0.shardName.
+        // - st.shard0.shardName will throw a stale config and refresh itself when the pipeline is
+        // sent to it (attempt 2).
+        // - mongosForAgg will back out, and redispatch (attempt 3).
         // - The aggregation will succeed on the third dispatch.
 
         // We confirm this behaviour via the following profiler results:
 
-        // - One aggregation on shard0001 with a shard version exception (indicating that the mongoS
-        // was stale).
+        // - One aggregation on st.shard1.shardName with a shard version exception (indicating that
+        // the mongoS was stale).
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: shard1DB,
             filter: {
@@ -305,8 +314,8 @@
             }
         });
 
-        // - One aggregation on shard0000 with a shard version exception (indicating that the shard
-        // was stale).
+        // - One aggregation on st.shard0.shardName with a shard version exception (indicating that
+        // the shard was stale).
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: shard0DB,
             filter: {
@@ -317,10 +326,10 @@
             }
         });
 
-        // - At most two aggregations on shard0000 with no stale config exceptions. The first, if
-        // present, is an aborted cursor created if the command reaches shard0000 before shard0001
-        // throws its stale config exception during attempt 1. The second profiler entry is the
-        // aggregation which succeeded.
+        // - At most two aggregations on st.shard0.shardName with no stale config exceptions. The
+        // first, if present, is an aborted cursor created if the command reaches
+        // st.shard0.shardName before st.shard1.shardName throws its stale config exception during
+        // attempt 1. The second profiler entry is the aggregation which succeeded.
         profilerHasAtLeastOneAtMostNumMatchingEntriesOrThrow({
             profileDB: shard0DB,
             filter: {
@@ -332,8 +341,8 @@
             maxExpectedMatches: 2
         });
 
-        // No $mergeCursors aggregation on primary shard0000, since after backing out the split
-        // pipeline we eventually target only shard0000.
+        // No $mergeCursors aggregation on primary st.shard0.shardName, since after backing out the
+        // split pipeline we eventually target only st.shard0.shardName.
         profilerHasZeroMatchingEntriesOrThrow({
             profileDB: primaryShardDB,
             filter: {

@@ -36,7 +36,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
@@ -160,10 +160,6 @@ std::unique_ptr<ShardingCatalogClient> ConfigServerTestFixture::makeShardingCata
     std::unique_ptr<DistLockManager> distLockManager) {
     invariant(distLockManager);
     return stdx::make_unique<ShardingCatalogClientImpl>(std::move(distLockManager));
-}
-
-std::unique_ptr<CatalogCache> ConfigServerTestFixture::makeCatalogCache() {
-    return stdx::make_unique<CatalogCache>(CatalogCacheLoader::get(getServiceContext()));
 }
 
 std::unique_ptr<BalancerConfiguration> ConfigServerTestFixture::makeBalancerConfiguration() {

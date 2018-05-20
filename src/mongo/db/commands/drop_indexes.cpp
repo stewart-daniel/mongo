@@ -51,8 +51,8 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builder.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 
@@ -89,7 +89,8 @@ public:
              const BSONObj& jsobj,
              BSONObjBuilder& result) {
         const NamespaceString nss = CommandHelpers::parseNsCollectionRequired(dbname, jsobj);
-        return CommandHelpers::appendCommandStatus(result, dropIndexes(opCtx, nss, jsobj, &result));
+        uassertStatusOK(dropIndexes(opCtx, nss, jsobj, &result));
+        return true;
     }
 
 } cmdDropIndexes;
@@ -121,30 +122,26 @@ public:
                    BSONObjBuilder& result) {
         DBDirectClient db(opCtx);
 
-        const NamespaceString toReIndexNs =
+        const NamespaceString toReIndexNss =
             CommandHelpers::parseNsCollectionRequired(dbname, jsobj);
 
-        LOG(0) << "CMD: reIndex " << toReIndexNs;
+        LOG(0) << "CMD: reIndex " << toReIndexNss;
 
-        Lock::DBLock dbXLock(opCtx, dbname, MODE_X);
-        OldClientContext ctx(opCtx, toReIndexNs.ns());
-
-        Collection* collection = ctx.db()->getCollection(opCtx, toReIndexNs);
+        AutoGetOrCreateDb autoDb(opCtx, dbname, MODE_X);
+        Collection* collection = autoDb.getDb()->getCollection(opCtx, toReIndexNss);
         if (!collection) {
-            if (ctx.db()->getViewCatalog()->lookup(opCtx, toReIndexNs.ns()))
-                return CommandHelpers::appendCommandStatus(
-                    result, {ErrorCodes::CommandNotSupportedOnView, "can't re-index a view"});
+            if (autoDb.getDb()->getViewCatalog()->lookup(opCtx, toReIndexNss.ns()))
+                uasserted(ErrorCodes::CommandNotSupportedOnView, "can't re-index a view");
             else
-                return CommandHelpers::appendCommandStatus(
-                    result, {ErrorCodes::NamespaceNotFound, "collection does not exist"});
+                uasserted(ErrorCodes::NamespaceNotFound, "collection does not exist");
         }
 
-        BackgroundOperation::assertNoBgOpInProgForNs(toReIndexNs.ns());
+        BackgroundOperation::assertNoBgOpInProgForNs(toReIndexNss.ns());
 
-        const auto featureCompatibilityVersion =
-            serverGlobalParams.featureCompatibility.getVersion();
-        const auto defaultIndexVersion =
-            IndexDescriptor::getDefaultIndexVersion(featureCompatibilityVersion);
+        // This is necessary to set up CurOp and update the Top stats.
+        OldClientContext ctx(opCtx, toReIndexNss.ns());
+
+        const auto defaultIndexVersion = IndexDescriptor::getDefaultIndexVersion();
 
         vector<BSONObj> all;
         {
@@ -199,16 +196,12 @@ public:
             indexer = stdx::make_unique<MultiIndexBlock>(opCtx, collection);
 
             swIndexesToRebuild = indexer->init(all);
-            if (!swIndexesToRebuild.isOK()) {
-                return CommandHelpers::appendCommandStatus(result, swIndexesToRebuild.getStatus());
-            }
+            uassertStatusOK(swIndexesToRebuild.getStatus());
             wunit.commit();
         }
 
         auto status = indexer->insertAllDocumentsInCollection();
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
+        uassertStatusOK(status);
 
         {
             WriteUnitOfWork wunit(opCtx);
@@ -220,9 +213,8 @@ public:
         // This was also done when dropAllIndexes() committed, but we need to ensure that no one
         // tries to read in the intermediate state where all indexes are newer than the current
         // snapshot so are unable to be used.
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        auto snapshotName = replCoord->getMinimumVisibleSnapshot(opCtx);
-        collection->setMinimumVisibleSnapshot(snapshotName);
+        auto clusterTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
+        collection->setMinimumVisibleSnapshot(clusterTime);
 
         result.append("nIndexes", static_cast<int>(swIndexesToRebuild.getValue().size()));
         result.append("indexes", swIndexesToRebuild.getValue());

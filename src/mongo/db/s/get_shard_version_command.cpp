@@ -35,7 +35,7 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
@@ -79,7 +79,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool run(OperationContext* opCtx,
@@ -99,8 +99,9 @@ public:
 
         ShardedConnectionInfo* const sci = ShardedConnectionInfo::get(opCtx->getClient(), false);
         result.appendBool("inShardedMode", sci != nullptr);
-        if (sci) {
-            result.appendTimestamp("mine", sci->getVersion(nss.ns()).toLong());
+
+        if (sci && sci->getVersion(nss.ns())) {
+            result.appendTimestamp("mine", sci->getVersion(nss.ns())->toLong());
         } else {
             result.appendTimestamp("mine", 0);
         }
@@ -108,7 +109,7 @@ public:
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
         CollectionShardingState* const css = CollectionShardingState::get(opCtx, nss);
 
-        const auto metadata = css->getMetadata();
+        const auto metadata = css->getMetadata(opCtx);
         if (metadata) {
             result.appendTimestamp("global", metadata->getShardVersion().toLong());
         } else {

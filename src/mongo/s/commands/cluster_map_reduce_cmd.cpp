@@ -38,6 +38,7 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/mr.h"
 #include "mongo/db/query/collation/collation_spec.h"
@@ -51,6 +52,7 @@
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
+#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -92,7 +94,7 @@ BSONObj fixForShards(const BSONObj& orig,
             b.append(e);
         } else if (fn == "out" || fn == "finalize" || fn == "writeConcern") {
             // We don't want to copy these
-        } else if (!CommandHelpers::isGenericArgument(fn)) {
+        } else if (!isGenericArgument(fn)) {
             badShardedField = fn.toString();
             return BSONObj();
         }
@@ -106,7 +108,9 @@ BSONObj fixForShards(const BSONObj& orig,
         b.append("splitInfo", maxChunkSizeBytes);
     }
 
-    return b.obj();
+    // mapReduce creates temporary collections and renames them at the end, so it will handle
+    // cluster collection creation differently.
+    return appendAllowImplicitCreate(b.obj(), true);
 }
 
 /**
@@ -277,18 +281,21 @@ public:
         if (!shardedInput && !shardedOutput && !customOutDB) {
             LOG(1) << "simple MR, just passthrough";
 
-            invariant(inputRoutingInfo.primary());
+            invariant(inputRoutingInfo.db().primary());
 
-            ShardConnection conn(inputRoutingInfo.primary()->getConnString(), "");
+            ShardConnection conn(inputRoutingInfo.db().primary()->getConnString(), "");
 
             BSONObj res;
             bool ok = conn->runCommand(
-                dbname, CommandHelpers::filterCommandRequestForPassthrough(cmdObj), res);
+                dbname,
+                appendAllowImplicitCreate(
+                    CommandHelpers::filterCommandRequestForPassthrough(cmdObj), true),
+                res);
             conn.done();
 
             if (auto wcErrorElem = res["writeConcernError"]) {
                 appendWriteConcernErrorToCmdResponse(
-                    inputRoutingInfo.primary()->getId(), wcErrorElem, result);
+                    inputRoutingInfo.db().primary()->getId(), wcErrorElem, result);
             }
 
             result.appendElementsUnique(CommandHelpers::filterCommandReplyForPassthrough(res));
@@ -443,7 +450,8 @@ public:
                 uassertStatusOK(shardRegistry->getShard(opCtx, outputDbInfo.primaryId()));
 
             ShardConnection conn(outputShard->getConnString(), outputCollNss.ns());
-            ok = conn->runCommand(outDB, finalCmd.obj(), singleResult);
+            ok = conn->runCommand(
+                outDB, appendAllowImplicitCreate(finalCmd.obj(), true), singleResult);
 
             BSONObj counts = singleResult.getObjectField("counts");
             postCountsB.append(conn->getServerAddress(), counts);
@@ -492,11 +500,9 @@ public:
                 // Take distributed lock to prevent split / migration.
                 auto scopedDistLock = catalogClient->getDistLockManager()->lock(
                     opCtx, outputCollNss.ns(), "mr-post-process", kNoDistLockTimeout);
-                if (!scopedDistLock.isOK()) {
-                    return CommandHelpers::appendCommandStatus(result, scopedDistLock.getStatus());
-                }
+                uassertStatusOK(scopedDistLock.getStatus());
 
-                BSONObj finalCmdObj = finalCmd.obj();
+                BSONObj finalCmdObj = appendAllowImplicitCreate(finalCmd.obj(), true);
                 mrCommandResults.clear();
 
                 try {
@@ -563,7 +569,7 @@ public:
             }
 
             // Do the splitting round
-            catalogCache->onStaleConfigError(std::move(outputRoutingInfo));
+            catalogCache->onStaleShardVersion(std::move(outputRoutingInfo));
             outputRoutingInfo =
                 uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, outputCollNss));
             uassert(34359,
@@ -580,13 +586,7 @@ public:
 
                 // Key reported should be the chunk's minimum
                 auto chunkWritten = outputCM->findIntersectingChunkWithSimpleCollation(key);
-                if (!chunkWritten) {
-                    warning() << "Mongod reported " << size << " bytes inserted for key " << key
-                              << " but can't find chunk";
-                } else {
-                    updateChunkWriteStatsAndSplitIfNeeded(
-                        opCtx, outputCM.get(), chunkWritten.get(), size);
-                }
+                updateChunkWriteStatsAndSplitIfNeeded(opCtx, outputCM.get(), chunkWritten, size);
             }
         }
 
@@ -687,8 +687,7 @@ private:
                 Shard::RetryPolicy::kIdempotent));
         uassertStatusOK(cmdResponse.commandStatus);
 
-        // Parse the UUID for the sharded collection from the shardCollection response, if one is
-        // present. It will only be present if the cluster is in fcv=3.6.
+        // Parse the UUID for the sharded collection from the shardCollection response.
         auto shardCollResponse = ConfigsvrShardCollectionResponse::parse(
             IDLParserErrorContext("ConfigsvrShardCollectionResponse"), cmdResponse.response);
         *outUUID = std::move(shardCollResponse.getCollectionUUID());

@@ -43,6 +43,7 @@
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
@@ -223,6 +224,15 @@ LockResult CondVarLockGrantNotification::wait(Milliseconds timeout) {
         : LOCK_TIMEOUT;
 }
 
+LockResult CondVarLockGrantNotification::wait(OperationContext* opCtx, Milliseconds timeout) {
+    invariant(opCtx);
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    return opCtx->waitForConditionOrInterruptFor(
+               _cond, lock, timeout, [this] { return _result != LOCK_INVALID; })
+        ? _result
+        : LOCK_TIMEOUT;
+}
+
 void CondVarLockGrantNotification::notify(ResourceId resId, LockResult result) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     invariant(_result == LOCK_INVALID);
@@ -257,12 +267,22 @@ stdx::thread::id LockerImpl<IsForMMAPV1>::getThreadId() const {
 }
 
 template <bool IsForMMAPV1>
+void LockerImpl<IsForMMAPV1>::updateThreadIdToCurrentThread() {
+    _threadId = stdx::this_thread::get_id();
+}
+
+template <bool IsForMMAPV1>
+void LockerImpl<IsForMMAPV1>::unsetThreadId() {
+    _threadId = stdx::thread::id();  // Reset to represent a non-executing thread.
+}
+
+template <bool IsForMMAPV1>
 LockerImpl<IsForMMAPV1>::~LockerImpl() {
     // Cannot delete the Locker while there are still outstanding requests, because the
     // LockManager may attempt to access deleted memory. Besides it is probably incorrect
     // to delete with unaccounted locks anyways.
     invariant(!inAWriteUnitOfWork());
-    invariant(_resourcesToUnlockAtEndOfUnitOfWork.empty());
+    invariant(_numResourcesToUnlockAtEndUnitOfWork == 0);
     invariant(_requests.empty());
     invariant(_modeForTicket == MODE_NONE);
 
@@ -282,11 +302,11 @@ Locker::ClientState LockerImpl<IsForMMAPV1>::getClientState() const {
 }
 
 template <bool IsForMMAPV1>
-LockResult LockerImpl<IsForMMAPV1>::lockGlobal(LockMode mode) {
-    LockResult result = _lockGlobalBegin(mode, Date_t::max());
+LockResult LockerImpl<IsForMMAPV1>::lockGlobal(OperationContext* opCtx, LockMode mode) {
+    LockResult result = _lockGlobalBegin(opCtx, mode, Date_t::max());
 
     if (result == LOCK_WAITING) {
-        result = lockGlobalComplete(Date_t::max());
+        result = lockGlobalComplete(opCtx, Date_t::max());
     }
 
     if (result == LOCK_OK) {
@@ -297,40 +317,47 @@ LockResult LockerImpl<IsForMMAPV1>::lockGlobal(LockMode mode) {
 }
 
 template <bool IsForMMAPV1>
-void LockerImpl<IsForMMAPV1>::reacquireTicket() {
+void LockerImpl<IsForMMAPV1>::reacquireTicket(OperationContext* opCtx) {
     invariant(_modeForTicket != MODE_NONE);
-    auto acquireTicketResult = _acquireTicket(_modeForTicket, Date_t::max());
+    auto acquireTicketResult = _acquireTicket(opCtx, _modeForTicket, Date_t::max());
     invariant(acquireTicketResult == LOCK_OK);
 }
 
 template <bool IsForMMAPV1>
-LockResult LockerImpl<IsForMMAPV1>::_acquireTicket(LockMode mode, Date_t deadline) {
+LockResult LockerImpl<IsForMMAPV1>::_acquireTicket(OperationContext* opCtx,
+                                                   LockMode mode,
+                                                   Date_t deadline) {
     const bool reader = isSharedLockMode(mode);
     auto holder = shouldAcquireTicket() ? ticketHolders[mode] : nullptr;
     if (holder) {
         _clientState.store(reader ? kQueuedReader : kQueuedWriter);
+
+        // If the ticket wait is interrupted, restore the state of the client.
+        auto restoreStateOnErrorGuard = MakeGuard([&] { _clientState.store(kInactive); });
         if (deadline == Date_t::max()) {
-            holder->waitForTicket();
-        } else if (!holder->waitForTicketUntil(deadline)) {
-            _clientState.store(kInactive);
+            holder->waitForTicket(opCtx);
+        } else if (!holder->waitForTicketUntil(opCtx, deadline)) {
             return LOCK_TIMEOUT;
         }
+        restoreStateOnErrorGuard.Dismiss();
     }
     _clientState.store(reader ? kActiveReader : kActiveWriter);
     return LOCK_OK;
 }
 
 template <bool IsForMMAPV1>
-LockResult LockerImpl<IsForMMAPV1>::_lockGlobalBegin(LockMode mode, Date_t deadline) {
+LockResult LockerImpl<IsForMMAPV1>::_lockGlobalBegin(OperationContext* opCtx,
+                                                     LockMode mode,
+                                                     Date_t deadline) {
     dassert(isLocked() == (_modeForTicket != MODE_NONE));
     if (_modeForTicket == MODE_NONE) {
-        auto acquireTicketResult = _acquireTicket(mode, deadline);
+        auto acquireTicketResult = _acquireTicket(opCtx, mode, deadline);
         if (acquireTicketResult != LOCK_OK) {
             return acquireTicketResult;
         }
         _modeForTicket = mode;
     }
-    const LockResult result = lockBegin(resourceIdGlobal, mode);
+    const LockResult result = lockBegin(opCtx, resourceIdGlobal, mode);
     if (result == LOCK_OK)
         return LOCK_OK;
 
@@ -342,8 +369,8 @@ LockResult LockerImpl<IsForMMAPV1>::_lockGlobalBegin(LockMode mode, Date_t deadl
 }
 
 template <bool IsForMMAPV1>
-LockResult LockerImpl<IsForMMAPV1>::lockGlobalComplete(Date_t deadline) {
-    return lockComplete(resourceIdGlobal, getLockMode(resourceIdGlobal), deadline, false);
+LockResult LockerImpl<IsForMMAPV1>::lockGlobalComplete(OperationContext* opCtx, Date_t deadline) {
+    return lockComplete(opCtx, resourceIdGlobal, getLockMode(resourceIdGlobal), deadline, false);
 }
 
 template <bool IsForMMAPV1>
@@ -426,9 +453,19 @@ void LockerImpl<IsForMMAPV1>::endWriteUnitOfWork() {
         return;
     }
 
-    while (!_resourcesToUnlockAtEndOfUnitOfWork.empty()) {
-        unlock(_resourcesToUnlockAtEndOfUnitOfWork.front());
-        _resourcesToUnlockAtEndOfUnitOfWork.pop();
+    LockRequestsMap::Iterator it = _requests.begin();
+    while (_numResourcesToUnlockAtEndUnitOfWork > 0) {
+        if (it->unlockPending) {
+            invariant(!it.finished());
+            _numResourcesToUnlockAtEndUnitOfWork--;
+        }
+        while (it->unlockPending > 0) {
+            // If a lock is converted, unlock() may be called multiple times on a resource within
+            // the same WriteUnitOfWork. All such unlock() requests must thus be fulfilled here.
+            it->unlockPending--;
+            unlock(it.key());
+        }
+        it.next();
     }
 
     // For MMAP V1, we need to yield the flush lock so that the flush thread can run
@@ -439,11 +476,10 @@ void LockerImpl<IsForMMAPV1>::endWriteUnitOfWork() {
 }
 
 template <bool IsForMMAPV1>
-LockResult LockerImpl<IsForMMAPV1>::lock(ResourceId resId,
-                                         LockMode mode,
-                                         Date_t deadline,
-                                         bool checkDeadlock) {
-    const LockResult result = lockBegin(resId, mode);
+LockResult LockerImpl<IsForMMAPV1>::lock(
+    OperationContext* opCtx, ResourceId resId, LockMode mode, Date_t deadline, bool checkDeadlock) {
+
+    const LockResult result = lockBegin(opCtx, resId, mode);
 
     // Fast, uncontended path
     if (result == LOCK_OK)
@@ -453,7 +489,7 @@ LockResult LockerImpl<IsForMMAPV1>::lock(ResourceId resId,
     // unsuccessful result that the lock manager would return is LOCK_WAITING.
     invariant(result == LOCK_WAITING);
 
-    return lockComplete(resId, mode, deadline, checkDeadlock);
+    return lockComplete(opCtx, resId, mode, deadline, checkDeadlock);
 }
 
 template <bool IsForMMAPV1>
@@ -466,10 +502,20 @@ template <bool IsForMMAPV1>
 bool LockerImpl<IsForMMAPV1>::unlock(ResourceId resId) {
     LockRequestsMap::Iterator it = _requests.find(resId);
     if (inAWriteUnitOfWork() && _shouldDelayUnlock(it.key(), (it->mode))) {
-        _resourcesToUnlockAtEndOfUnitOfWork.push(it.key());
+        if (!it->unlockPending) {
+            _numResourcesToUnlockAtEndUnitOfWork++;
+        }
+        it->unlockPending++;
+        // unlockPending will only be incremented if a lock is converted and unlock() is called
+        // multiple times on one ResourceId.
+        invariant(it->unlockPending < LockModesCount);
+
         return false;
     }
 
+    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
+    if (it.finished())
+        return false;
     return _unlockImpl(&it);
 }
 
@@ -534,7 +580,7 @@ bool LockerImpl<IsForMMAPV1>::isCollectionLockedForMode(StringData ns, LockMode 
             break;
     }
 
-    invariant(false);
+    MONGO_UNREACHABLE;
     return false;
 }
 
@@ -580,6 +626,13 @@ void LockerImpl<IsForMMAPV1>::getLockerInfo(LockerInfo* lockerInfo) const {
 
     lockerInfo->waitingResource = getWaitingResource();
     lockerInfo->stats.append(_stats);
+}
+
+template <bool IsForMMAPV1>
+boost::optional<Locker::LockerInfo> LockerImpl<IsForMMAPV1>::getLockerInfo() const {
+    Locker::LockerInfo lockerInfo;
+    getLockerInfo(&lockerInfo);
+    return std::move(lockerInfo);
 }
 
 template <bool IsForMMAPV1>
@@ -643,7 +696,8 @@ bool LockerImpl<IsForMMAPV1>::saveLockStateAndUnlock(Locker::LockSnapshot* state
 }
 
 template <bool IsForMMAPV1>
-void LockerImpl<IsForMMAPV1>::restoreLockState(const Locker::LockSnapshot& state) {
+void LockerImpl<IsForMMAPV1>::restoreLockState(OperationContext* opCtx,
+                                               const Locker::LockSnapshot& state) {
     // We shouldn't be saving and restoring lock state from inside a WriteUnitOfWork.
     invariant(!inAWriteUnitOfWork());
     invariant(_modeForTicket == MODE_NONE);
@@ -651,11 +705,11 @@ void LockerImpl<IsForMMAPV1>::restoreLockState(const Locker::LockSnapshot& state
     std::vector<OneLock>::const_iterator it = state.locks.begin();
     // If we locked the PBWM, it must be locked before the resourceIdGlobal resource.
     if (it != state.locks.end() && it->resourceId == resourceIdParallelBatchWriterMode) {
-        invariant(LOCK_OK == lock(it->resourceId, it->mode));
+        invariant(LOCK_OK == lock(opCtx, it->resourceId, it->mode));
         it++;
     }
 
-    invariant(LOCK_OK == lockGlobal(state.globalMode));
+    invariant(LOCK_OK == lockGlobal(opCtx, state.globalMode));
     for (; it != state.locks.end(); it++) {
         // This is a sanity check that lockGlobal restored the MMAP V1 flush lock in the
         // expected mode.
@@ -669,7 +723,9 @@ void LockerImpl<IsForMMAPV1>::restoreLockState(const Locker::LockSnapshot& state
 }
 
 template <bool IsForMMAPV1>
-LockResult LockerImpl<IsForMMAPV1>::lockBegin(ResourceId resId, LockMode mode) {
+LockResult LockerImpl<IsForMMAPV1>::lockBegin(OperationContext* opCtx,
+                                              ResourceId resId,
+                                              LockMode mode) {
     dassert(!getWaitingResource().isValid());
 
     LockRequest* request;
@@ -685,6 +741,17 @@ LockResult LockerImpl<IsForMMAPV1>::lockBegin(ResourceId resId, LockMode mode) {
     } else {
         request = it.objAddr();
         isNew = false;
+    }
+
+    // If unlockPending is nonzero, that means a LockRequest already exists for this resource but
+    // is planned to be released at the end of this WUOW due to two-phase locking. Rather than
+    // unlocking the existing request, we can reuse it if the existing mode matches the new mode.
+    if (request->unlockPending && isModeCovered(mode, request->mode)) {
+        request->unlockPending--;
+        if (!request->unlockPending) {
+            _numResourcesToUnlockAtEndUnitOfWork--;
+        }
+        return LOCK_OK;
     }
 
     // Making this call here will record lock re-acquisitions and conversions as well.
@@ -723,16 +790,24 @@ LockResult LockerImpl<IsForMMAPV1>::lockBegin(ResourceId resId, LockMode mode) {
     if (result == LOCK_WAITING) {
         globalStats.recordWait(_id, resId, mode);
         _stats.recordWait(resId, mode);
+    } else if (result == LOCK_OK && opCtx && _uninterruptibleLocksRequested == 0) {
+        // Lock acquisitions are not allowed to succeed when opCtx is marked as interrupted, unless
+        // the caller requested an uninterruptible lock.
+        auto interruptStatus = opCtx->checkForInterruptNoAssert();
+        if (!interruptStatus.isOK()) {
+            auto unlockIt = _requests.find(resId);
+            invariant(unlockIt);
+            _unlockImpl(&unlockIt);
+            uassertStatusOK(interruptStatus);
+        }
     }
 
     return result;
 }
 
 template <bool IsForMMAPV1>
-LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
-                                                 LockMode mode,
-                                                 Date_t deadline,
-                                                 bool checkDeadlock) {
+LockResult LockerImpl<IsForMMAPV1>::lockComplete(
+    OperationContext* opCtx, ResourceId resId, LockMode mode, Date_t deadline, bool checkDeadlock) {
     // Under MMAP V1 engine a deadlock can occur if a thread goes to sleep waiting on
     // DB lock, while holding the flush lock, so it has to be released. This is only
     // correct to do if not in a write unit of work.
@@ -742,6 +817,13 @@ LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
     if (yieldFlushLock) {
         invariant(unlock(resourceIdMMAPV1Flush));
     }
+    auto relockFlushLockGuard = MakeGuard([&] {
+        if (yieldFlushLock) {
+            // We cannot obey the timeout here, because it is not correct to return from the lock
+            // request with the flush lock released.
+            invariant(LOCK_OK == lock(resourceIdMMAPV1Flush, _getModeForMMAPV1FlushLock()));
+        }
+    });
 
     LockResult result;
     Milliseconds timeout;
@@ -753,16 +835,36 @@ LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
         timeout = deadline - Date_t::now();
     }
 
+    // If _maxLockTimeout is set and lower than the given timeout, override it.
+    // TODO: there should be an invariant against the simultaneous usage of
+    // _uninterruptibleLocksRequested and _maxLockTimeout (SERVER-34951).
+    if (_maxLockTimeout && _uninterruptibleLocksRequested == 0) {
+        timeout = std::min(timeout, _maxLockTimeout.get());
+    }
+
     // Don't go sleeping without bound in order to be able to report long waits or wake up for
     // deadlock detection.
     Milliseconds waitTime = std::min(timeout, DeadlockTimeout);
     const uint64_t startOfTotalWaitTime = curTimeMicros64();
     uint64_t startOfCurrentWaitTime = startOfTotalWaitTime;
 
+    // Clean up the state on any failed lock attempts.
+    auto unlockOnErrorGuard = MakeGuard([&] {
+        LockRequestsMap::Iterator it = _requests.find(resId);
+        _unlockImpl(&it);
+    });
+
     while (true) {
         // It is OK if this call wakes up spuriously, because we re-evaluate the remaining
         // wait time anyways.
-        result = _notify.wait(waitTime);
+        // If we have an operation context, we want to use its interruptible wait so that
+        // pending lock acquisitions can be cancelled, so long as no callers have requested an
+        // uninterruptible lock.
+        if (opCtx && _uninterruptibleLocksRequested == 0) {
+            result = _notify.wait(opCtx, waitTime);
+        } else {
+            result = _notify.wait(waitTime);
+        }
 
         // Account for the time spent waiting on the notification object
         const uint64_t curTimeMicros = curTimeMicros64();
@@ -799,25 +901,26 @@ LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
                                               : Milliseconds(0);
 
         if (waitTime == Milliseconds(0)) {
+            // If the caller provided the max deadline then presumably they are not expecting nor
+            // checking for lock acquisition failure. In that case, to prevent the caller from
+            // continuing under the assumption of a successful lock acquisition, we'll throw.
+            if (_maxLockTimeout && deadline == Date_t::max()) {
+                uasserted(ErrorCodes::LockTimeout,
+                          str::stream() << "Unable to acquire lock '" << resId.toString()
+                                        << "' within a max lock request timeout of '"
+                                        << _maxLockTimeout.get()
+                                        << "' milliseconds.");
+            }
             break;
         }
     }
 
-    // Cleanup the state, since this is an unused lock now.
     // Note: in case of the _notify object returning LOCK_TIMEOUT, it is possible to find that the
     // lock was still granted after all, but we don't try to take advantage of that and will return
     // a timeout.
-    if (result != LOCK_OK) {
-        LockRequestsMap::Iterator it = _requests.find(resId);
-        _unlockImpl(&it);
+    if (result == LOCK_OK) {
+        unlockOnErrorGuard.Dismiss();
     }
-
-    if (yieldFlushLock) {
-        // We cannot obey the timeout here, because it is not correct to return from the lock
-        // request with the flush lock released.
-        invariant(LOCK_OK == lock(resourceIdMMAPV1Flush, _getModeForMMAPV1FlushLock()));
-    }
-
     return result;
 }
 
@@ -872,7 +975,7 @@ LockMode LockerImpl<IsForMMAPV1>::_getModeForMMAPV1FlushLock() const {
         case MODE_IS:
             return MODE_IS;
         default:
-            invariant(false);
+            MONGO_UNREACHABLE;
             return MODE_NONE;
     }
 }
@@ -962,7 +1065,7 @@ namespace {
 /**
  *  Periodically purges unused lock buckets. The first time the lock is used again after
  *  cleanup it needs to be allocated, and similarly, every first use by a client for an intent
- *  mode may need to create a partitioned lock head. Cleanup is done roughtly once a minute.
+ *  mode may need to create a partitioned lock head. Cleanup is done roughly once a minute.
  */
 class UnusedLockCleaner : PeriodicTask {
 public:

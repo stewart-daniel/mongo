@@ -44,7 +44,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/scopeguard.h"
 
@@ -75,6 +75,10 @@ public:
     }
     std::string help() const override {
         return " example: { renameCollection: foo.a, to: bar.b }";
+    }
+
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     static void dropCollection(OperationContext* opCtx, Database* db, StringData collName) {
@@ -144,19 +148,18 @@ public:
             return false;
         }
 
-        if (source.isAdminDotSystemDotVersion()) {
-            CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation,
-                       "renaming admin.system.version is not allowed"));
-            return false;
+        if (source.isServerConfigurationCollection()) {
+            uasserted(ErrorCodes::IllegalOperation,
+                      "renaming the server configuration "
+                      "collection (admin.system.version) is not "
+                      "allowed");
         }
 
         RenameCollectionOptions options;
         options.dropTarget = cmdObj["dropTarget"].trueValue();
         options.stayTemp = cmdObj["stayTemp"].trueValue();
-        return CommandHelpers::appendCommandStatus(
-            result, renameCollection(opCtx, source, target, options));
+        uassertStatusOK(renameCollection(opCtx, source, target, options));
+        return true;
     }
 
 } cmdrenamecollection;

@@ -54,6 +54,14 @@ class WiredTigerRecordStore;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
 
+struct WiredTigerFileVersion {
+    enum class StartupVersion { IS_34, IS_36, IS_40 };
+
+    StartupVersion _startupVersion;
+    bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
+    std::string getDowngradeString();
+};
+
 class WiredTigerKVEngine final : public KVEngine {
 public:
     static const int kDefaultJournalDelayMillis;
@@ -136,6 +144,10 @@ public:
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident);
 
+    virtual void alterIdentMetadata(OperationContext* opCtx,
+                                    StringData ident,
+                                    const IndexDescriptor* desc);
+
     virtual Status okToRename(OperationContext* opCtx,
                               StringData fromNS,
                               StringData toNS,
@@ -170,18 +182,24 @@ public:
 
     /**
      * This method will force the oldest timestamp to the input value. Callers must be serialized
-     * along with `_advanceOldestTimestamp`
+     * along with `setStableTimestamp`
      */
     void setOldestTimestamp(Timestamp oldestTimestamp);
 
-    Timestamp getPreviousSetOldestTimestamp() const {
-        stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
-        return _previousSetOldestTimestamp;
-    }
-
     virtual bool supportsRecoverToStableTimestamp() const override;
 
-    virtual Status recoverToStableTimestamp() override;
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
+
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
+
+    /**
+     * Returns a timestamp value that is at or before the last checkpoint. Everything before this
+     * value is guaranteed to be persisted on disk and replication recovery will not need to
+     * replay documents with an earlier time.
+     */
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const override;
+
+    virtual Timestamp getAllCommittedTimestamp() const override;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -244,7 +262,7 @@ public:
     /**
      * Initializes a background job to remove excess documents in the oplog collections.
      * This applies to the capped collections in the local.oplog.* namespaces (specifically
-     * local.oplog.rs for replica sets and local.oplog.$main for master/slave replication).
+     * local.oplog.rs for replica sets).
      * Returns true if a background job is running for the namespace.
      */
     static bool initRsOplogBackgroundThread(StringData ns);
@@ -262,24 +280,17 @@ private:
 
     std::string _uri(StringData ident) const;
 
-    // Not threadsafe; callers must be serialized along with `setOldestTimestamp`.
-    void _advanceOldestTimestamp(Timestamp oldestTimestamp);
-
-    // Protected by _oplogManagerMutex.
-    Timestamp _previousSetOldestTimestamp;
+    void _setOldestTimestamp(Timestamp oldestTimestamp, bool force = false);
 
     WT_CONNECTION* _conn;
     WT_EVENT_HANDLER _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
     ClockSource* const _clockSource;
 
-    // Mutex to protect use of _oplogManager and _oplogManagerCount by this instance of KV
-    // engine.
-    // Uses of _oplogManager by the oplog record stores themselves are safe without locking, since
-    // those record stores manage the oplogManager lifetime.
+    // Mutex to protect use of _oplogManagerCount by this instance of KV engine.
     mutable stdx::mutex _oplogManagerMutex;
-    std::unique_ptr<WiredTigerOplogManager> _oplogManager;
     std::size_t _oplogManagerCount = 0;
+    std::unique_ptr<WiredTigerOplogManager> _oplogManager;
 
     std::string _canonicalName;
     std::string _path;
@@ -291,6 +302,7 @@ private:
 
     bool _durable;
     bool _ephemeral;
+    const bool _inRepairMode;
     bool _readOnly;
     std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
     std::unique_ptr<WiredTigerCheckpointThread> _checkpointThread;
@@ -305,5 +317,7 @@ private:
     mutable Date_t _previousCheckedDropsQueued;
 
     std::unique_ptr<WiredTigerSession> _backupSession;
+    Timestamp _recoveryTimestamp;
+    WiredTigerFileVersion _fileVersion;
 };
 }

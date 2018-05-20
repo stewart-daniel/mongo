@@ -40,7 +40,6 @@
 #include <signal.h>
 #include <string>
 
-#include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
@@ -50,6 +49,7 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database.h"
@@ -70,6 +70,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index_names.h"
@@ -93,14 +94,15 @@
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
@@ -108,6 +110,8 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state.h"
@@ -116,6 +120,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/session_killer.h"
@@ -124,6 +129,7 @@
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/system_index.h"
 #include "mongo/db/ttl.h"
@@ -153,7 +159,7 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/listen.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
@@ -162,12 +168,17 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/sequence_util.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/text.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
+
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_options.h"
+#endif
 
 #if !defined(_WIN32)
 #include <sys/file.h>
@@ -204,7 +215,7 @@ void logStartup(OperationContext* opCtx) {
 
     BSONObjBuilder buildinfo(toLog.subobjStart("buildinfo"));
     VersionInfoInterface::instance().appendBuildInfo(&buildinfo);
-    appendStorageEngineList(&buildinfo);
+    appendStorageEngineList(opCtx->getServiceContext(), &buildinfo);
     buildinfo.doneFast();
 
     BSONObj o = toLog.obj();
@@ -217,7 +228,7 @@ void logStartup(OperationContext* opCtx) {
     if (!collection) {
         BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
         repl::UnreplicatedWritesBlock uwb(opCtx);
-        uassertStatusOK(userCreateNS(opCtx, db, startupLogCollectionName.ns(), options));
+        uassertStatusOK(Database::userCreateNS(opCtx, db, startupLogCollectionName.ns(), options));
         collection = db->getCollection(opCtx, startupLogCollectionName);
     }
     invariant(collection);
@@ -265,12 +276,21 @@ ExitCode _initAndListen(int listenPort) {
     Client::initThread("initandlisten");
 
     initWireSpec();
-    auto serviceContext = checked_cast<ServiceContextMongoD*>(getGlobalServiceContext());
+    auto serviceContext = getGlobalServiceContext();
 
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
     auto opObserverRegistry = stdx::make_unique<OpObserverRegistry>();
     opObserverRegistry->addObserver(stdx::make_unique<OpObserverImpl>());
     opObserverRegistry->addObserver(stdx::make_unique<UUIDCatalogObserver>());
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        opObserverRegistry->addObserver(stdx::make_unique<ShardServerOpObserver>());
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        opObserverRegistry->addObserver(stdx::make_unique<ConfigServerOpObserver>());
+    }
+    setupFreeMonitoringOpObserver(opObserverRegistry.get());
+
+
     serviceContext->setOpObserver(std::move(opObserverRegistry));
 
     DBDirectClientFactory::get(serviceContext).registerImplementation([](OperationContext* opCtx) {
@@ -285,10 +305,6 @@ ExitCode _initAndListen(int listenPort) {
         LogstreamBuilder l = log(LogComponent::kControl);
         l << "MongoDB starting : pid=" << pid << " port=" << serverGlobalParams.port
           << " dbpath=" << storageGlobalParams.dbpath;
-        if (replSettings.isMaster())
-            l << " master=" << replSettings.isMaster();
-        if (replSettings.isSlave())
-            l << " slave=" << (int)replSettings.isSlave();
 
         const bool is32bit = sizeof(int*) == 4;
         l << (is32bit ? " 32" : " 64") << "-bit host=" << getHostNameCached() << endl;
@@ -302,7 +318,7 @@ ExitCode _initAndListen(int listenPort) {
 
     logProcessDetails();
 
-    serviceContext->createLockFile();
+    createLockFile(serviceContext);
 
     serviceContext->setServiceEntryPoint(
         stdx::make_unique<ServiceEntryPointMongod>(serviceContext));
@@ -318,7 +334,7 @@ ExitCode _initAndListen(int listenPort) {
         serviceContext->setTransportLayer(std::move(tl));
     }
 
-    serviceContext->initializeGlobalStorageEngine();
+    initializeStorageEngine(serviceContext);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
     if (EncryptionHooks::get(serviceContext)->restartRequired()) {
@@ -338,7 +354,7 @@ ExitCode _initAndListen(int listenPort) {
             }
 
             // Warn if field name matches non-active registered storage engine.
-            if (serviceContext->isRegisteredStorageEngine(e.fieldName())) {
+            if (isRegisteredStorageEngine(serviceContext, e.fieldName())) {
                 warning() << "Detected configuration for non-active storage engine "
                           << e.fieldName() << " when current storage engine is "
                           << storageGlobalParams.engine;
@@ -356,6 +372,18 @@ ExitCode _initAndListen(int listenPort) {
     }
 
     logMongodStartupWarnings(storageGlobalParams, serverGlobalParams, serviceContext);
+
+#ifdef MONGO_CONFIG_SSL
+    if (sslGlobalParams.sslAllowInvalidCertificates &&
+        ((serverGlobalParams.clusterAuthMode.load() == ServerGlobalParams::ClusterAuthMode_x509) ||
+         sequenceContains(saslGlobalParams.authenticationMechanisms, "MONGODB-X509"))) {
+        log() << "** WARNING: While invalid X509 certificates may be used to" << startupWarningsLog;
+        log() << "**          connect to this server, they will not be considered"
+              << startupWarningsLog;
+        log() << "**          permissible for authentication." << startupWarningsLog;
+        log() << startupWarningsLog;
+    }
+#endif
 
     {
         std::stringstream ss;
@@ -389,8 +417,8 @@ ExitCode _initAndListen(int listenPort) {
 
     auto startupOpCtx = serviceContext->makeOperationContext(&cc());
 
-    bool canCallFCVSetIfCleanStartup = !storageGlobalParams.readOnly &&
-        !(replSettings.isSlave() || storageGlobalParams.engine == "devnull");
+    bool canCallFCVSetIfCleanStartup =
+        !storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");
     if (canCallFCVSetIfCleanStartup && !replSettings.usingReplSets()) {
         Lock::GlobalWrite lk(startupOpCtx.get());
         FeatureCompatibilityVersion::setIfCleanStartup(startupOpCtx.get(),
@@ -465,7 +493,7 @@ ExitCode _initAndListen(int listenPort) {
 
         if (foundSchemaVersion <= AuthorizationManager::schemaVersion26Final) {
             log() << "This server is using MONGODB-CR, an authentication mechanism which "
-                  << "has been removed from MongoDB 3.8. In order to upgrade the auth schema, "
+                  << "has been removed from MongoDB 4.0. In order to upgrade the auth schema, "
                   << "first downgrade MongoDB binaries to version 3.6 and then run the "
                   << "authSchemaUpgrade command. "
                   << "See http://dochub.mongodb.org/core/3.0-upgrade-to-scram-sha-1";
@@ -486,8 +514,6 @@ ExitCode _initAndListen(int listenPort) {
               << startupWarningsLog;
     }
 
-    SessionCatalog::create(serviceContext);
-
     // This function may take the global lock.
     auto shardingInitialized =
         uassertStatusOK(ShardingState::get(startupOpCtx.get())
@@ -501,6 +527,8 @@ ExitCode _initAndListen(int listenPort) {
 
         startMongoDFTDC();
 
+        startFreeMonitoring(serviceContext);
+
         restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
 
         if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
@@ -509,8 +537,6 @@ ExitCode _initAndListen(int listenPort) {
                 uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            ShardedConnectionInfo::addHook(startupOpCtx->getServiceContext());
-
             uassertStatusOK(
                 initializeGlobalShardingStateForMongod(startupOpCtx.get(),
                                                        ConnectionString::forLocal(),
@@ -539,9 +565,16 @@ ExitCode _initAndListen(int listenPort) {
         if (missingRepl) {
             log() << startupWarningsLog;
             log() << "** WARNING: mongod started without --replSet yet " << missingRepl
-                  << " documents are present in local.system.replset" << startupWarningsLog;
-            log() << "**          Restart with --replSet unless you are doing maintenance and "
-                  << " no other clients are connected." << startupWarningsLog;
+                  << " documents are present in local.system.replset." << startupWarningsLog;
+            log() << "**          Database contents may appear inconsistent with the oplog and may "
+                     "appear to not contain"
+                  << startupWarningsLog;
+            log() << "**          writes that were visible when this node was running as part of a "
+                     "replica set."
+                  << startupWarningsLog;
+            log() << "**          Restart with --replSet unless you are doing maintenance and no "
+                     "other clients are connected."
+                  << startupWarningsLog;
             log() << "**          The TTL collection monitor will not start because of this."
                   << startupWarningsLog;
             log() << "**         ";
@@ -551,8 +584,7 @@ ExitCode _initAndListen(int listenPort) {
             startTTLBackgroundJob();
         }
 
-        if (replSettings.usingReplSets() || (!replSettings.isMaster() && replSettings.isSlave()) ||
-            !internalValidateFeaturesAsMaster) {
+        if (replSettings.usingReplSets() || !internalValidateFeaturesAsMaster) {
             serverGlobalParams.validateFeaturesAsMaster.store(false);
         }
     }
@@ -562,12 +594,21 @@ ExitCode _initAndListen(int listenPort) {
     PeriodicTask::startRunningPeriodicTasks();
 
     // Set up the periodic runner for background job execution
-    auto runner = makePeriodicRunner();
-    runner->startup().transitional_ignore();
+    auto runner = makePeriodicRunner(serviceContext);
+    runner->startup();
     serviceContext->setPeriodicRunner(std::move(runner));
 
     SessionKiller::set(serviceContext,
                        std::make_shared<SessionKiller>(serviceContext, killSessionsLocal));
+
+    // Start up a background task to periodically check for and kill expired transactions.
+    // Only do this on storage engines supporting snapshot reads, which hold resources we wish to
+    // release periodically in order to avoid storage cache pressure build up.
+    auto storageEngine = serviceContext->getStorageEngine();
+    invariant(storageEngine);
+    if (storageEngine->supportsReadConcernSnapshot()) {
+        startPeriodicThreadToAbortExpiredTransactions(serviceContext);
+    }
 
     // Set up the logical session cache
     LogicalSessionCacheServer kind = LogicalSessionCacheServer::kStandalone;
@@ -746,12 +787,11 @@ auto makeReplicationExecutor(ServiceContext* serviceContext) {
     hookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
     return stdx::make_unique<executor::ThreadPoolTaskExecutor>(
         stdx::make_unique<ThreadPool>(tpOptions),
-        executor::makeNetworkInterface(
-            "NetworkInterfaceASIO-Replication", nullptr, std::move(hookList)));
+        executor::makeNetworkInterface("Replication", nullptr, std::move(hookList)));
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
-                                     ("SetGlobalEnvironment", "SSLManager", "default"))
+                                     ("SSLManager", "ServiceContext", "default"))
 (InitializerContext* context) {
     auto serviceContext = getGlobalServiceContext();
     repl::StorageInterface::set(serviceContext, stdx::make_unique<repl::StorageInterfaceImpl>());
@@ -822,7 +862,7 @@ void shutdownTask() {
     // Shut down the global dbclient pool so callers stop waiting for connections.
     globalConnPool.shutdown();
 
-    if (serviceContext->getGlobalStorageEngine()) {
+    if (serviceContext->getStorageEngine()) {
         ServiceContext::UniqueOperationContext uniqueOpCtx;
         OperationContext* opCtx = client->getOperationContext();
         if (!opCtx) {
@@ -830,29 +870,16 @@ void shutdownTask() {
             opCtx = uniqueOpCtx.get();
         }
 
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
-            // If we are in latest fCV, drop the 'checkpointTimestamp' collection so if we downgrade
-            // and then upgrade again, we do not trust a stale 'checkpointTimestamp'.
-            log(LogComponent::kReplication)
-                << "shutdown: removing checkpointTimestamp collection...";
-            Status status =
-                repl::StorageInterface::get(serviceContext)
-                    ->dropCollection(opCtx,
-                                     NamespaceString(repl::ReplicationConsistencyMarkersImpl::
-                                                         kDefaultCheckpointTimestampNamespace));
-            if (!status.isOK()) {
-                warning(LogComponent::kReplication)
-                    << "shutdown: dropping checkpointTimestamp collection failed: "
-                    << redact(status.toString());
-            }
-        }
-
         // This can wait a long time while we drain the secondary's apply queue, especially if it
         // is building an index.
         repl::ReplicationCoordinator::get(serviceContext)->shutdown(opCtx);
 
         ShardingState::get(serviceContext)->shutDown(opCtx);
+
+        // Destroy all stashed transaction resources, in order to release locks.
+        SessionKiller::Matcher matcherAllSessions(
+            KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+        killSessionsLocalKillTransactions(opCtx, matcherAllSessions);
     }
 
     serviceContext->setKillAllOperations();
@@ -896,6 +923,7 @@ void shutdownTask() {
         }
     }
 #endif
+    stopFreeMonitoring();
 
     // Shutdown Full-Time Data Capture
     stopMongoDFTDC();
@@ -920,8 +948,8 @@ void shutdownTask() {
     invariant(LOCK_OK == result);
 
     // Global storage engine may not be started in all cases before we exit
-    if (serviceContext->getGlobalStorageEngine()) {
-        serviceContext->shutdownGlobalStorageEngineCleanly();
+    if (serviceContext->getStorageEngine()) {
+        shutdownGlobalStorageEngineCleanly(serviceContext);
     }
 
     // We drop the scope cache because leak sanitizer can't see across the

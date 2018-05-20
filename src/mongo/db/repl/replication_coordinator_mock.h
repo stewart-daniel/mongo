@@ -111,8 +111,6 @@ public:
 
     virtual bool shouldRelaxIndexConstraints(OperationContext* opCtx, const NamespaceString& ns);
 
-    virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
-
     virtual void setMyLastAppliedOpTime(const OpTime& opTime);
     virtual void setMyLastDurableOpTime(const OpTime& opTime);
 
@@ -198,8 +196,6 @@ public:
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion);
 
-    virtual Status processHandshake(OperationContext* opCtx, const HandshakeArgs& handshake);
-
     virtual bool buildsIndexes();
 
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten);
@@ -215,6 +211,8 @@ public:
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
 
     virtual void resetLastOpTimesFromOplog(OperationContext* opCtx, DataConsistency consistency);
+
+    bool lastOpTimesWereReset() const;
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const rpc::ReplSetMetadata& replMetadata,
@@ -242,8 +240,6 @@ public:
     virtual long long getTerm();
 
     virtual Status updateTerm(OperationContext* opCtx, long long term);
-
-    virtual Timestamp getMinimumVisibleSnapshot(OperationContext* opCtx) override;
 
     virtual void dropAllSnapshots() override;
 
@@ -288,6 +284,8 @@ public:
 
     virtual Status abortCatchupIfNeeded() override;
 
+    void signalDropPendingCollectionsRemovedFromStorage() final;
+
 private:
     AtomicUInt64 _snapshotNameGenerator;
     ServiceContext* const _service;
@@ -300,6 +298,7 @@ private:
         return StatusAndDuration(Status::OK(), Milliseconds(0));
     };
     bool _alwaysAllowWrites = false;
+    bool _resetLastOpTimesCalled = false;
 };
 
 }  // namespace repl

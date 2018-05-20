@@ -84,8 +84,7 @@ public:
     /**
      * Returns the spec for the id index to create by default for this collection.
      */
-    BSONObj getDefaultIdIndexSpec(ServerGlobalParams::FeatureCompatibility::Version
-                                      featureCompatibilityVersion) const override;
+    BSONObj getDefaultIdIndexSpec() const override;
 
     IndexDescriptor* findIdIndex(OperationContext* opCtx) const override;
 
@@ -230,7 +229,7 @@ public:
      */
     void dropAllIndexes(OperationContext* opCtx,
                         bool includingIdIndex,
-                        std::map<std::string, BSONObj>* droppedIndexes = nullptr) override;
+                        stdx::function<void(const IndexDescriptor*)> onDropFn = nullptr) override;
 
     Status dropIndex(OperationContext* opCtx, IndexDescriptor* desc) override;
 
@@ -304,6 +303,10 @@ public:
 
         IndexCatalogEntry* getEntry() {
             return _entry;
+        }
+
+        const std::string& getIndexName() {
+            return _indexName;
         }
 
     private:

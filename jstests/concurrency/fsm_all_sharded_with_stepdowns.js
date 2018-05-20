@@ -12,11 +12,10 @@ var blacklist = [
     'create_database.js',      // SERVER-17397 Drops of sharded namespaces may not fully succeed
     'drop_database.js',        // SERVER-17397 Drops of sharded namespaces may not fully succeed
 
-    // Disabled due to SERVER-3645, '.count() can be wrong on sharded collections'.
-    // This bug is problematic for these workloads because they assert on count() values:
+    // Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
+    // collections'. This bug is problematic for these workloads because they assert on count()
+    // values:
     'agg_match.js',
-    'count.js',
-    'count_limit_skip.js',
 
     // $lookup and $graphLookup are not supported on sharded collections.
     'agg_graph_lookup.js',
@@ -59,15 +58,9 @@ var blacklist = [
     'findAndModify_update_queue_unindexed.js',  // findAndModify requires a shard key
     'group.js',                // the group command cannot be issued against a sharded cluster
     'group_cond.js',           // the group command cannot be issued against a sharded cluster
+    'group_killop.js',         // the group command cannot be issued against a sharded cluster
     'indexed_insert_eval.js',  // eval doesn't work with sharded collections
     'indexed_insert_eval_nolock.js',  // eval doesn't work with sharded collections
-
-    // These workloads sometimes triggers an 'unable to target write op for collection ... caused by
-    // ... database not found' error. Further investigation still needs to be done, but these
-    // failures may be due to SERVER-17397 'drops in a sharded cluster may not fully succeed'
-    // because it drops and reuses the same namespaces.
-    'kill_multicollection_aggregation.js',
-    'invalidated_cursors.js',
 
     'plan_cache_drop_database.js',  // cannot ensureIndex after dropDatabase without sharding first
     'remove_single_document.js',    // our .remove(query, {justOne: true}) calls lack shard keys
@@ -111,6 +104,7 @@ var blacklist = [
     // Use getmores.
     'agg_base.js',
     'create_index_background.js',
+    'globally_managed_cursors.js',
     'indexed_insert_ordered_bulk.js',
     'indexed_insert_text.js',
     'indexed_insert_unordered_bulk.js',
@@ -137,8 +131,6 @@ var blacklist = [
     'remove_and_bulk_insert.js',
     'update_and_bulk_insert.js',
     'update_check_index.js',
-    'update_multifield_isolated_multiupdate.js',
-    'update_multifield_isolated_multiupdate_noindex.js',
     'update_multifield_multiupdate.js',
     'update_multifield_multiupdate_noindex.js',
     'update_ordered_bulk_inc.js',
@@ -152,6 +144,8 @@ var blacklist = [
     'collmod.js',
     'collmod_separate_collections.js',
     'view_catalog.js',
+    'kill_multicollection_aggregation.js',  // Uses getMore.
+    'invalidated_cursors.js',               // Uses getMore.
 
     // The auto_retry_on_network_error.js override needs to overwrite the response from drop on
     // NamespaceNotFound, and since this workload only creates and drops collections there isn't

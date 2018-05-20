@@ -19,6 +19,18 @@ env.Library(
     ],
 )
 
+env.CppUnitTest(
+    target='shard_remote_test',
+    source=[
+        'shard_remote_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/s/sharding_router_test_fixture',
+        '$BUILD_DIR/mongo/s/query/async_results_merger',
+        'sharding_client',
+    ],
+)
+
 env.Library(
     target='sharding_connection_hook',
     source=[
@@ -38,7 +50,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/s/coreshard',
-        '$BUILD_DIR/mongo/s/sharding_test_fixture',
+        '$BUILD_DIR/mongo/s/sharding_router_test_fixture',
     ]
 )
 
@@ -74,7 +86,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         'rs_local_client',
         'shard_interface'
     ],
@@ -86,6 +98,7 @@ env.CppUnitTest(
         'shard_local_test.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         'shard_local',

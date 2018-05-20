@@ -33,6 +33,7 @@
 #include "mongo/db/logical_clock.h"
 
 #include "mongo/base/status.h"
+#include "mongo/db/global_settings.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
@@ -43,29 +44,18 @@ namespace mongo {
 
 constexpr Seconds LogicalClock::kMaxAcceptableLogicalClockDriftSecs;
 
-server_parameter_storage_type<long long, ServerParameterType::kStartupOnly>::value_type
-    maxAcceptableLogicalClockDriftSecs(LogicalClock::kMaxAcceptableLogicalClockDriftSecs.count());
-
-class MaxAcceptableLogicalClockDriftSecs
-    : public ExportedServerParameter<long long, ServerParameterType::kStartupOnly> {
-public:
-    MaxAcceptableLogicalClockDriftSecs()
-        : ExportedServerParameter<long long, ServerParameterType::kStartupOnly>(
-              ServerParameterSet::getGlobal(),
-              "maxAcceptableLogicalClockDriftSecs",
-              &maxAcceptableLogicalClockDriftSecs) {}
-
-    Status validate(const long long& potentialNewValue) {
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(maxAcceptableLogicalClockDriftSecs,
+                                      long long,
+                                      LogicalClock::kMaxAcceptableLogicalClockDriftSecs.count())
+    ->withValidator([](const long long& potentialNewValue) {
         if (potentialNewValue <= 0) {
             return Status(ErrorCodes::BadValue,
                           str::stream() << "maxAcceptableLogicalClockDriftSecs must be positive, "
                                            "but attempted to set to: "
                                         << potentialNewValue);
         }
-
         return Status::OK();
-    }
-} maxAcceptableLogicalClockDriftSecsParameter;
+    });
 
 namespace {
 const auto getLogicalClock = ServiceContext::declareDecoration<std::unique_ptr<LogicalClock>>();
@@ -74,6 +64,14 @@ bool lessThanOrEqualToMaxPossibleTime(LogicalTime time, uint64_t nTicks) {
     return time.asTimestamp().getSecs() <= LogicalClock::kMaxSignedInt &&
         time.asTimestamp().getInc() <= (LogicalClock::kMaxSignedInt - nTicks);
 }
+}
+
+LogicalTime LogicalClock::getClusterTimeForReplicaSet(OperationContext* opCtx) {
+    if (getGlobalReplSettings().usingReplSets()) {
+        return get(opCtx)->getClusterTime();
+    }
+
+    return {};
 }
 
 LogicalClock* LogicalClock::get(ServiceContext* service) {
@@ -159,7 +157,6 @@ LogicalTime LogicalClock::reserveTicks(uint64_t nTicks) {
 
 void LogicalClock::setClusterTimeFromTrustedSource(LogicalTime newTime) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-
     // Rate limit checks are skipped here so a server with no activity for longer than
     // maxAcceptableLogicalClockDriftSecs seconds can still have its cluster time initialized.
 
@@ -192,6 +189,16 @@ Status LogicalClock::_passesRateLimiter_inlock(LogicalTime newTime) {
             lessThanOrEqualToMaxPossibleTime(newTime, 0));
 
     return Status::OK();
+}
+
+bool LogicalClock::isEnabled() const {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _isEnabled;
+}
+
+void LogicalClock::disable() {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _isEnabled = false;
 }
 
 }  // namespace mongo

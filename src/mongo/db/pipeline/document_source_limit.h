@@ -32,7 +32,7 @@
 
 namespace mongo {
 
-class DocumentSourceLimit final : public DocumentSource, public SplittableDocumentSource {
+class DocumentSourceLimit final : public DocumentSource, public NeedsMergerDocumentSource {
 public:
     static constexpr StringData kStageName = "$limit"_sd;
 
@@ -53,7 +53,8 @@ public:
                 PositionRequirement::kNone,
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kAllowed};
+                FacetRequirement::kAllowed,
+                TransactionRequirement::kAllowed};
     }
 
     GetNextResult getNext() final;

@@ -72,7 +72,6 @@ namespace repl {
 
 class ElectCmdRunner;
 class FreshnessChecker;
-class HandshakeArgs;
 class HeartbeatResponseAction;
 class LastVote;
 class OplogReader;
@@ -146,8 +145,6 @@ public:
 
     virtual bool shouldRelaxIndexConstraints(OperationContext* opCtx, const NamespaceString& ns);
 
-    virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
-
     virtual void setMyLastAppliedOpTime(const OpTime& opTime);
     virtual void setMyLastDurableOpTime(const OpTime& opTime);
 
@@ -169,8 +166,6 @@ public:
                                           const ReadConcernArgs& readConcern) override;
 
     virtual OID getElectionId() override;
-
-    virtual OID getMyRID() const override;
 
     virtual int getMyId() const override;
 
@@ -236,9 +231,6 @@ public:
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion) override;
 
-    virtual Status processHandshake(OperationContext* opCtx,
-                                    const HandshakeArgs& handshake) override;
-
     virtual bool buildsIndexes() override;
 
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op,
@@ -296,8 +288,6 @@ public:
 
     virtual Status updateTerm(OperationContext* opCtx, long long term) override;
 
-    virtual Timestamp getMinimumVisibleSnapshot(OperationContext* opCtx) override;
-
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
 
     virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
@@ -318,6 +308,8 @@ public:
     virtual Status stepUpIfEligible() override;
 
     virtual Status abortCatchupIfNeeded() override;
+
+    void signalDropPendingCollectionsRemovedFromStorage() final;
 
     // ================== Test support API ===================
 
@@ -633,8 +625,6 @@ private:
     void _signalStepDownWaiterIfReady_inlock();
 
     bool _canAcceptWritesFor_inlock(const NamespaceString& ns);
-
-    OID _getMyRID_inlock() const;
 
     int _getMyId_inlock() const;
 
@@ -969,8 +959,10 @@ private:
 
     /**
      * Blesses a snapshot to be used for new committed reads.
+     *
+     * Returns true if the value was updated to `newCommittedSnapshot`.
      */
-    void _updateCommittedSnapshot_inlock(const OpTime& newCommittedSnapshot);
+    bool _updateCommittedSnapshot_inlock(const OpTime& newCommittedSnapshot);
 
     /**
      * A helper method that returns the current stable optime based on the current commit point and
@@ -983,8 +975,8 @@ private:
      * current commit point. The stable optime is the greatest optime in 'candidates' that is
      * also less than or equal to 'commitPoint'.
      */
-    boost::optional<OpTime> _calculateStableOpTime(const std::set<OpTime>& candidates,
-                                                   const OpTime& commitPoint);
+    boost::optional<OpTime> _calculateStableOpTime_inlock(const std::set<OpTime>& candidates,
+                                                          const OpTime& commitPoint);
 
     /**
      * Removes any optimes from the optime set 'candidates' that are less than
@@ -1129,8 +1121,8 @@ private:
     // (PS) Pointer is read-only in concurrent operation, item pointed to is self-synchronizing;
     //      Access in any context.
     // (M)  Reads and writes guarded by _mutex
-    // (GM) Readable under any global intent lock.  Must hold both the global lock in exclusive
-    //      mode (MODE_X) and hold _mutex to write.
+    // (GM) Readable under any global intent lock or _mutex.  Must hold both the global lock in
+    //      exclusive mode (MODE_X) and hold _mutex to write.
     // (I)  Independently synchronized, see member variable comment.
 
     // Protects member data of this ReplicationCoordinator.
@@ -1162,10 +1154,6 @@ private:
 
     // Pointer to the ReplicationCoordinatorExternalState owned by this ReplicationCoordinator.
     std::unique_ptr<ReplicationCoordinatorExternalState> _externalState;  // (PS)
-
-    // Our RID, used to identify us to our sync source when sending replication progress
-    // updates upstream.  Set once in startReplication() and then never modified again.
-    OID _myRID;  // (M)
 
     // list of information about clients waiting on replication.  Does *not* own the WaiterInfos.
     WaiterList _replicationWaiterList;  // (M)
@@ -1233,7 +1221,7 @@ private:
 
     // Flag that indicates whether writes to databases other than "local" are allowed.  Used to
     // answer canAcceptWritesForDatabase() and canAcceptWritesFor() questions.
-    // Always true for standalone nodes and masters in master-slave relationships.
+    // Always true for standalone nodes.
     bool _canAcceptNonLocalWrites;  // (GM)
 
     // Flag that indicates whether reads from databases other than "local" are allowed.  Unlike

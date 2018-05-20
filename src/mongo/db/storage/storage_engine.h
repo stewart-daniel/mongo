@@ -139,6 +139,11 @@ public:
     };
 
     /**
+    * The destructor should only be called if we are tearing down but not exiting the process.
+    */
+    virtual ~StorageEngine() {}
+
+    /**
      * Called after the globalStorageEngine pointer has been set up, before any other methods
      * are called. Any initialization work that requires the ability to create OperationContexts
      * should be done here rather than in the constructor.
@@ -320,8 +325,9 @@ public:
      * used should be one provided by StorageEngine::setStableTimestamp().
      *
      * The "local" database is exempt and should not roll back any state except for
-     * "local.replset.minvalid" and "local.replset.checkpointTimestamp" which must roll back to
-     * the last stable timestamp.
+     * "local.replset.minvalid" which must roll back to the last stable timestamp.
+     *
+     * If successful, returns the timestamp that the storage engine recovered to.
      *
      * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return
      * false. Returns a bad status if there is no stable timestamp to recover to.
@@ -329,8 +335,27 @@ public:
      * It is illegal to call this concurrently with `setStableTimestamp` or
      * `setInitialDataTimestamp`.
      */
-    virtual Status recoverToStableTimestamp() {
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) {
         fassertFailed(40547);
+    }
+
+    /**
+     * Returns the stable timestamp that the storage engine recovered to on startup. If the
+     * recovery point was not stable, returns "none".
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false.
+     */
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Returns a timestamp that is guaranteed to be persisted to disk in a checkpoint. Returns
+     * boost::none if there is no stable checkpoint. This method should return at least the value of
+     * `getRecoveryTimestamp` if the node started from a stable checkpoint. fasserts if
+     * StorageEngine::supportsRecoverToStableTimestamp() would return false.
+     */
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const {
+        MONGO_UNREACHABLE;
     }
 
     /**
@@ -372,11 +397,13 @@ public:
         return std::vector<CollectionIndexNamePair>();
     };
 
-protected:
     /**
-     * The destructor will never be called. See cleanShutdown instead.
+     * Returns the all committed timestamp. All transactions with timestamps earlier than the
+     * all committed timestamp are committed. Only storage engines that support document level
+     * locking must provide an implementation. Other storage engines may provide a no-op
+     * implementation.
      */
-    virtual ~StorageEngine() {}
+    virtual Timestamp getAllCommittedTimestamp() const = 0;
 };
 
 }  // namespace mongo

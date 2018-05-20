@@ -37,6 +37,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/platform/random.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/transport/baton.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/fail_point_service.h"
@@ -66,11 +67,12 @@ MONGO_FP_DECLARE(maxTimeNeverTimeOut);
 //
 // {configureFailPoint: "checkForInterruptFail",
 //  mode: "alwaysOn",
-//  data: {conn: 17, chance: .01}}
+//  data: {threadName: "threadName", chance: .01}}
 //
-// Both data fields must be specified.  In the above example, all interrupt points on connection 17
-// will generate a kill on the current operation with probability p(.01), including interrupt points
-// of nested operations.  "chance" must be a double between 0 and 1, inclusive.
+// Both data fields must be specified. In the above example, all interrupt points on the thread with
+// name 'threadName' will generate a kill on the current operation with probability p(.01),
+// including interrupt points of nested operations. "chance" must be a double between 0 and 1,
+// inclusive.
 MONGO_FP_DECLARE(checkForInterruptFail);
 
 }  // namespace
@@ -168,17 +170,15 @@ namespace {
 // Helper function for checkForInterrupt fail point.  Decides whether the operation currently
 // being run by the given Client meet the (probabilistic) conditions for interruption as
 // specified in the fail point info.
-bool opShouldFail(const OperationContext* opCtx, const BSONObj& failPointInfo) {
+bool opShouldFail(Client* client, const BSONObj& failPointInfo) {
     // Only target the client with the specified connection number.
-    if (opCtx->getClient()->getConnectionId() != failPointInfo["conn"].safeNumberLong()) {
+    if (client->desc() != failPointInfo["threadName"].valuestrsafe()) {
         return false;
     }
 
     // Return true with (approx) probability p = "chance".  Recall: 0 <= chance <= 1.
-    double next = static_cast<double>(std::abs(opCtx->getClient()->getPrng().nextInt64()));
-    double upperBound =
-        std::numeric_limits<int64_t>::max() * failPointInfo["chance"].numberDouble();
-    if (next > upperBound) {
+    double next = client->getPrng().nextCanonicalDouble();
+    if (next > failPointInfo["chance"].numberDouble()) {
         return false;
     }
     return true;
@@ -200,7 +200,7 @@ Status OperationContext::checkForInterruptNoAssert() {
     }
 
     MONGO_FAIL_POINT_BLOCK(checkForInterruptFail, scopedFailPoint) {
-        if (opShouldFail(this, scopedFailPoint.getData())) {
+        if (opShouldFail(getClient(), scopedFailPoint.getData())) {
             log() << "set pending kill on op " << getOpID() << ", for checkForInterruptFail";
             markKilled();
         }
@@ -357,6 +357,11 @@ void OperationContext::markKilled(ErrorCodes::Error killCode) {
         invariant(_waitCV);
         _waitCV->notify_all();
     }
+
+    // If we have a baton, we need to wake it up.  The baton itself will check for interruption
+    if (_baton) {
+        _baton->schedule([] {});
+    }
 }
 
 void OperationContext::setLogicalSessionId(LogicalSessionId lsid) {
@@ -374,10 +379,10 @@ RecoveryUnit* OperationContext::releaseRecoveryUnit() {
     return _recoveryUnit.release();
 }
 
-OperationContext::RecoveryUnitState OperationContext::setRecoveryUnit(RecoveryUnit* unit,
-                                                                      RecoveryUnitState state) {
+WriteUnitOfWork::RecoveryUnitState OperationContext::setRecoveryUnit(
+    RecoveryUnit* unit, WriteUnitOfWork::RecoveryUnitState state) {
     _recoveryUnit.reset(unit);
-    RecoveryUnitState oldState = _ruState;
+    WriteUnitOfWork::RecoveryUnitState oldState = _ruState;
     _ruState = state;
     return oldState;
 }

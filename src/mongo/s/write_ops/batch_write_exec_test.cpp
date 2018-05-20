@@ -30,10 +30,11 @@
 
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/sharding_test_fixture.h"
+#include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
@@ -159,23 +160,30 @@ public:
     void expectInsertsReturnError(const std::vector<BSONObj>& expected,
                                   const BatchedCommandResponse& errResponse) {
         onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
-            ASSERT_EQUALS(nss.db(), request.dbname);
+            try {
+                ASSERT_EQUALS(nss.db(), request.dbname);
 
-            const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
-            const auto actualBatchedInsert(BatchedCommandRequest::parseInsert(opMsgRequest));
-            ASSERT_EQUALS(nss.toString(), actualBatchedInsert.getNS().ns());
+                const auto opMsgRequest(
+                    OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
+                const auto actualBatchedInsert(BatchedCommandRequest::parseInsert(opMsgRequest));
+                ASSERT_EQUALS(nss.toString(), actualBatchedInsert.getNS().ns());
 
-            const auto& inserted = actualBatchedInsert.getInsertRequest().getDocuments();
-            ASSERT_EQUALS(expected.size(), inserted.size());
+                const auto& inserted = actualBatchedInsert.getInsertRequest().getDocuments();
+                ASSERT_EQUALS(expected.size(), inserted.size());
 
-            auto itInserted = inserted.begin();
-            auto itExpected = expected.begin();
+                auto itInserted = inserted.begin();
+                auto itExpected = expected.begin();
 
-            for (; itInserted != inserted.end(); itInserted++, itExpected++) {
-                ASSERT_BSONOBJ_EQ(*itExpected, *itInserted);
+                for (; itInserted != inserted.end(); itInserted++, itExpected++) {
+                    ASSERT_BSONOBJ_EQ(*itExpected, *itInserted);
+                }
+
+                return errResponse.toBSON();
+            } catch (const DBException& ex) {
+                BSONObjBuilder bb;
+                CommandHelpers::appendCommandStatusNoThrow(bb, ex.toStatus());
+                return bb.obj();
             }
-
-            return errResponse.toBSON();
         });
     }
 

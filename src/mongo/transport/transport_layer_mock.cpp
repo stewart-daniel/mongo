@@ -34,7 +34,6 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/transport/mock_session.h"
 #include "mongo/transport/transport_layer.h"
-#include "mongo/util/net/message.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -62,6 +61,18 @@ bool TransportLayerMock::owns(Session::Id id) {
     return _sessions.count(id) > 0;
 }
 
+StatusWith<SessionHandle> TransportLayerMock::connect(HostAndPort peer,
+                                                      ConnectSSLMode sslMode,
+                                                      Milliseconds timeout) {
+    MONGO_UNREACHABLE;
+}
+
+Future<SessionHandle> TransportLayerMock::asyncConnect(HostAndPort peer,
+                                                       ConnectSSLMode sslMode,
+                                                       const ReactorHandle& reactor) {
+    MONGO_UNREACHABLE;
+}
+
 Status TransportLayerMock::setup() {
     return Status::OK();
 }
@@ -74,6 +85,10 @@ void TransportLayerMock::shutdown() {
     if (!inShutdown()) {
         _shutdown = true;
     }
+}
+
+ReactorHandle TransportLayerMock::getReactor(WhichReactor which) {
+    return nullptr;
 }
 
 bool TransportLayerMock::inShutdown() const {

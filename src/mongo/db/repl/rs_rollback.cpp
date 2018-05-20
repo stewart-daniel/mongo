@@ -39,13 +39,13 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -429,11 +429,10 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
                     return Status(ErrorCodes::UnrecoverableRollbackError, message);
                 }
 
-                // Checks if dropTarget is false. If it has a UUID value, we need to
+                // Checks if dropTarget is present. If it has a UUID value, we need to
                 // make sure to un-drop the collection that was dropped in the process
                 // of renaming.
-                auto dropTarget = obj.getField("dropTarget");
-                if (dropTarget.type() != Bool) {
+                if (auto dropTarget = obj.getField("dropTarget")) {
                     auto status =
                         fixUpInfo.recordDropTargetInfo(dropTarget, obj, oplogEntry.getOpTime());
                     if (!status.isOK()) {
@@ -608,13 +607,12 @@ void checkRbidAndUpdateMinValid(OperationContext* opCtx,
     // online until we get to that point in freshness. In other words, we do not transition from
     // RECOVERING state to SECONDARY state until we have reached the minValid oplog entry.
 
-    OpTime minValid = fassertStatusOK(40492, OpTime::parseFromOplogEntry(newMinValidDoc));
+    OpTime minValid = fassert(40492, OpTime::parseFromOplogEntry(newMinValidDoc));
     log() << "Setting minvalid to " << minValid;
 
     // This method is only used with storage engines that do not support recover to stable
     // timestamp. As a result, the timestamp on the 'appliedThrough' update does not matter.
-    invariant(
-        !opCtx->getServiceContext()->getGlobalStorageEngine()->supportsRecoverToStableTimestamp());
+    invariant(!opCtx->getServiceContext()->getStorageEngine()->supportsRecoverToStableTimestamp());
     replicationProcess->getConsistencyMarkers()->clearAppliedThrough(opCtx, {});
     replicationProcess->getConsistencyMarkers()->setMinValid(opCtx, minValid);
 
@@ -729,7 +727,7 @@ void rollbackDropIndexes(OperationContext* opCtx,
         log() << "Creating index in rollback for collection: " << nss << ", UUID: " << uuid
               << ", index: " << indexName;
 
-        createIndexForApplyOps(opCtx, indexSpec, nss, {});
+        createIndexForApplyOps(opCtx, indexSpec, nss, {}, OplogApplication::Mode::kRecovering);
 
         LOG(1) << "Created index in rollback for collection: " << nss << ", UUID: " << uuid
                << ", index: " << indexName;
@@ -743,45 +741,47 @@ void dropCollection(OperationContext* opCtx,
                     NamespaceString nss,
                     Collection* collection,
                     Database* db) {
-    Helpers::RemoveSaver removeSaver("rollback", "", nss.ns());
+    if (RollbackImpl::shouldCreateDataFiles()) {
+        Helpers::RemoveSaver removeSaver("rollback", "", nss.ns());
 
-    // Performs a collection scan and writes all documents in the collection to disk
-    // in order to keep an archive of items that were rolled back.
-    auto exec = InternalPlanner::collectionScan(
-        opCtx, nss.toString(), collection, PlanExecutor::YIELD_AUTO);
-    BSONObj curObj;
-    PlanExecutor::ExecState execState;
-    while (PlanExecutor::ADVANCED == (execState = exec->getNext(&curObj, NULL))) {
-        auto status = removeSaver.goingToDelete(curObj);
-        if (!status.isOK()) {
-            severe() << "Rolling back createCollection on " << nss
-                     << " failed to write document to remove saver file: " << redact(status);
-            throw RSFatalException(
-                "Rolling back createCollection. Failed to write document to remove saver "
-                "file.");
+        // Performs a collection scan and writes all documents in the collection to disk
+        // in order to keep an archive of items that were rolled back.
+        auto exec = InternalPlanner::collectionScan(
+            opCtx, nss.toString(), collection, PlanExecutor::YIELD_AUTO);
+        BSONObj curObj;
+        PlanExecutor::ExecState execState;
+        while (PlanExecutor::ADVANCED == (execState = exec->getNext(&curObj, NULL))) {
+            auto status = removeSaver.goingToDelete(curObj);
+            if (!status.isOK()) {
+                severe() << "Rolling back createCollection on " << nss
+                         << " failed to write document to remove saver file: " << redact(status);
+                throw RSFatalException(
+                    "Rolling back createCollection. Failed to write document to remove saver "
+                    "file.");
+            }
         }
-    }
 
-    // If we exited the above for loop with any other execState than IS_EOF, this means that
-    // a FAILURE or DEAD state was returned. If a DEAD state occurred, the collection or
-    // database that we are attempting to save may no longer be valid. If a FAILURE state
-    // was returned, either an unrecoverable error was thrown by exec, or we attempted to
-    // retrieve data that could not be provided by the PlanExecutor. In both of these cases
-    // it is necessary for a full resync of the server.
+        // If we exited the above for loop with any other execState than IS_EOF, this means that
+        // a FAILURE or DEAD state was returned. If a DEAD state occurred, the collection or
+        // database that we are attempting to save may no longer be valid. If a FAILURE state
+        // was returned, either an unrecoverable error was thrown by exec, or we attempted to
+        // retrieve data that could not be provided by the PlanExecutor. In both of these cases
+        // it is necessary for a full resync of the server.
 
-    if (execState != PlanExecutor::IS_EOF) {
-        if (execState == PlanExecutor::FAILURE &&
-            WorkingSetCommon::isValidStatusMemberObject(curObj)) {
-            Status errorStatus = WorkingSetCommon::getMemberObjectStatus(curObj);
-            severe() << "Rolling back createCollection on " << nss << " failed with "
-                     << redact(errorStatus) << ". A full resync is necessary.";
-            throw RSFatalException(
-                "Rolling back createCollection failed. A full resync is necessary.");
-        } else {
-            severe() << "Rolling back createCollection on " << nss
-                     << " failed. A full resync is necessary.";
-            throw RSFatalException(
-                "Rolling back createCollection failed. A full resync is necessary.");
+        if (execState != PlanExecutor::IS_EOF) {
+            if (execState == PlanExecutor::FAILURE &&
+                WorkingSetCommon::isValidStatusMemberObject(curObj)) {
+                Status errorStatus = WorkingSetCommon::getMemberObjectStatus(curObj);
+                severe() << "Rolling back createCollection on " << nss << " failed with "
+                         << redact(errorStatus) << ". A full resync is necessary.";
+                throw RSFatalException(
+                    "Rolling back createCollection failed. A full resync is necessary.");
+            } else {
+                severe() << "Rolling back createCollection on " << nss
+                         << " failed. A full resync is necessary.";
+                throw RSFatalException(
+                    "Rolling back createCollection failed. A full resync is necessary.");
+            }
         }
     }
 
@@ -790,7 +790,7 @@ void dropCollection(OperationContext* opCtx,
     // We permanently drop the collection rather than 2-phase drop the collection
     // here. By not passing in an opTime to dropCollectionEvenIfSystem() the collection
     // is immediately dropped.
-    fassertStatusOK(40504, db->dropCollectionEvenIfSystem(opCtx, nss));
+    fassert(40504, db->dropCollectionEvenIfSystem(opCtx, nss));
     wunit.commit();
 }
 
@@ -843,7 +843,7 @@ void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollecti
     log() << "Attempting to rename collection with UUID: " << uuid << ", from: " << info.renameFrom
           << ", to: " << info.renameTo;
     Lock::DBLock dbLock(opCtx, dbName, MODE_X);
-    auto db = dbHolder().openDb(opCtx, dbName);
+    auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName);
     invariant(db);
 
     auto status = renameCollectionForRollback(opCtx, info.renameTo, uuid);
@@ -916,8 +916,8 @@ Status _syncRollback(OperationContext* opCtx,
             }
         }
 
-        how.commonPoint = res.getValue().first;             // OpTime
-        how.commonPointOurDiskloc = res.getValue().second;  // RecordID
+        how.commonPoint = res.getValue().getOpTime();
+        how.commonPointOurDiskloc = res.getValue().getRecordId();
         how.removeRedundantOperations();
     } catch (const RSFatalException& e) {
         return Status(ErrorCodes::UnrecoverableRollbackError,
@@ -945,7 +945,7 @@ Status _syncRollback(OperationContext* opCtx,
     try {
         ON_BLOCK_EXIT([&] {
             auto status = replicationProcess->incrementRollbackID(opCtx);
-            fassertStatusOK(40497, status);
+            fassert(40497, status);
         });
         syncFixUp(opCtx, how, rollbackSource, replCoord, replicationProcess);
     } catch (const RSFatalException& e) {
@@ -1031,7 +1031,11 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             // If the collection turned into a view, we might get an error trying to
             // refetch documents, but these errors should be ignored, as we'll be creating
             // the view during oplog replay.
-            if (ex.code() == ErrorCodes::CommandNotSupportedOnView)
+            // Collection may be dropped on the sync source, in which case it will be dropped during
+            // oplog replay. So it is safe to ignore NamespaceNotFound errors while trying to
+            // refetch documents.
+            if (ex.code() == ErrorCodes::CommandNotSupportedOnView ||
+                ex.code() == ErrorCodes::NamespaceNotFound)
                 continue;
 
             log() << "Rollback couldn't re-fetch from uuid: " << uuid << " _id: " << redact(doc._id)
@@ -1137,7 +1141,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
             Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
 
-            auto db = dbHolder().openDb(opCtx, nss.db().toString());
+            auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, nss.db().toString());
             invariant(db);
 
             Collection* collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);
@@ -1254,7 +1258,9 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
         NamespaceString nss = catalog.lookupNSSByUUID(uuid);
 
-        removeSaver.reset(new Helpers::RemoveSaver("rollback", "", nss.ns()));
+        if (RollbackImpl::shouldCreateDataFiles()) {
+            removeSaver = std::make_unique<Helpers::RemoveSaver>("rollback", "", nss.ns());
+        }
 
         const auto& goodVersionsByDocID = nsAndGoodVersionsByDocID.second;
         for (const auto& idAndDoc : goodVersionsByDocID) {
@@ -1392,7 +1398,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     log() << "Rollback deleted " << deletes << " documents and updated " << updates
           << " documents.";
 
-    log() << "Truncating the oplog at " << fixUpInfo.commonPoint.toString();
+    log() << "Truncating the oplog at " << fixUpInfo.commonPoint.toString() << " ("
+          << fixUpInfo.commonPointOurDiskloc << "), non-inclusive";
 
     // Cleans up the oplog.
     {

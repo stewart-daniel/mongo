@@ -34,7 +34,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
@@ -73,7 +73,7 @@ bool ViewShardingCheck::collectionIsSharded(OperationContext* opCtx, const Names
     // and must be for a sharding check.
     dassert(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IS));
     AutoGetCollection autoGetCol(opCtx, nss, MODE_IS);
-    return CollectionShardingState::get(opCtx, nss)->collectionIsSharded();
+    return CollectionShardingState::get(opCtx, nss)->collectionIsSharded(opCtx);
 }
 
 }  // namespace mongo

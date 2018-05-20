@@ -35,7 +35,7 @@
 #include <algorithm>
 
 #include "mongo/db/background.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -76,9 +76,7 @@ Status _finishDropDatabase(OperationContext* opCtx, const std::string& dbName, D
     if (MONGO_FAIL_POINT(dropDatabaseHangAfterLastCollectionDrop)) {
         log() << "dropDatabase - fail point dropDatabaseHangAfterLastCollectionDrop enabled. "
                  "Blocking until fail point is disabled. ";
-        while (MONGO_FAIL_POINT(dropDatabaseHangAfterLastCollectionDrop)) {
-            mongo::sleepsecs(1);
-        }
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(dropDatabaseHangAfterLastCollectionDrop);
     }
 
     WriteUnitOfWork wunit(opCtx);
@@ -117,6 +115,7 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
     using Result = boost::optional<Status>;
     // Get an optional result--if it's there, early return; otherwise, wait for collections to drop.
     auto result = writeConflictRetry(opCtx, "dropDatabase_collection", dbName, [&] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         Lock::GlobalWrite lk(opCtx);
         AutoGetDb autoDB(opCtx, dbName, MODE_X);
         Database* const db = autoDB.getDb();
@@ -177,7 +176,7 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
             // A primary processing this will assign a timestamp when the operation is written to
             // the oplog. As stated above, a secondary processing must only observe non-replicated
             // collections, thus this should not be timestamped.
-            fassertStatusOK(40476, db->dropCollectionEvenIfSystem(opCtx, nss));
+            fassert(40476, db->dropCollectionEvenIfSystem(opCtx, nss));
             wunit.commit();
         }
         dropPendingGuard.Dismiss();
@@ -197,6 +196,7 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
     // If waitForWriteConcern() returns an error or throws an exception, we should reset the
     // drop-pending state on Database.
     auto dropPendingGuardWhileAwaitingReplication = MakeGuard([dbName, opCtx] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         Lock::GlobalWrite lk(opCtx);
         AutoGetDb autoDB(opCtx, dbName, MODE_X);
         if (auto db = autoDB.getDb()) {
@@ -228,6 +228,10 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
             return latestDropPendingOpTime;
         }();
 
+        log() << "dropDatabase " << dbName << " waiting for " << awaitOpTime
+              << " to be replicated at " << kDropDatabaseWriteConcern.toBSON() << ". Dropping "
+              << numCollectionsToDrop << " collections, with last collection drop at "
+              << latestDropPendingOpTime;
         auto result = replCoord->awaitReplication(opCtx, awaitOpTime, kDropDatabaseWriteConcern);
         const auto& status = result.status;
         if (!status.isOK()) {
@@ -247,6 +251,7 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
     dropPendingGuardWhileAwaitingReplication.Dismiss();
 
     return writeConflictRetry(opCtx, "dropDatabase_database", dbName, [&] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         Lock::GlobalWrite lk(opCtx);
         AutoGetDb autoDB(opCtx, dbName, MODE_X);
         auto db = autoDB.getDb();

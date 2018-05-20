@@ -24,7 +24,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
         '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/index_entry_comparison',
         '$BUILD_DIR/mongo/db/storage/journal_listener',
         '$BUILD_DIR/mongo/db/storage/key_string',
@@ -36,7 +36,10 @@ env.Library(
 
 serveronlyLibDepsDependents = []
 if mobile_se:
-    serveronlyLibDepsDependents = ['$BUILD_DIR/mongo/mongodmain']
+    serveronlyLibDepsDependents = [
+        '$BUILD_DIR/mongo/mongodmain',
+        '$BUILD_DIR/mongo/dbtests/testframework',
+        ]
 
 env.Library(
     target='storage_mobile',
@@ -47,8 +50,11 @@ env.Library(
     LIBDEPS=[
         'storage_mobile_core',
         '$BUILD_DIR/mongo/db/storage/kv/kv_engine'
-        ]   
-    )  
+        ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/storage/storage_engine_common',
+    ],
+)
 '''
 env.CppUnitTest(
     target='storage_mobile_index_test',
@@ -83,5 +89,9 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/storage/kv/kv_engine_test_harness',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         'storage_mobile_core',
-    ]
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/repl/service_context_repl_mock_init',
+    ],
 )

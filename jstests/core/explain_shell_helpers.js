@@ -1,6 +1,6 @@
 // Cannot implicitly shard accessed collections because the explain output from a mongod when run
 // against a sharded collection is wrapped in a "shards" object with keys for each shard.
-// @tags: [assumes_unsharded_collection, does_not_support_stepdowns]
+// @tags: [assumes_unsharded_collection, does_not_support_stepdowns, requires_fastcount]
 
 // Tests for the .explain() shell helper, which provides syntactic sugar for the explain command.
 
@@ -174,12 +174,6 @@ assert.commandWorked(explain);
 explain = t.explain().find().comment("test .comment").finish();
 assert.commandWorked(explain);
 explain = t.find().comment("test .comment").explain();
-assert.commandWorked(explain);
-
-// .snapshot()
-explain = t.explain().find().snapshot().finish();
-assert.commandWorked(explain);
-explain = t.find().snapshot().explain();
 assert.commandWorked(explain);
 
 // .next()

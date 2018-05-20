@@ -39,12 +39,14 @@ struct __wt_hazard {
 
 typedef TAILQ_HEAD(__wt_cursor_list, __wt_cursor)	WT_CURSOR_LIST;
 
-/* Number of cursors cached to trigger sweep. */
+/* Number of cursors cached to trigger cursor sweep. */
 #define	WT_SESSION_CURSOR_SWEEP_COUNTDOWN	20
 
-/* Maximum number of buckets to visit during sweep. */
-#define	WT_SESSION_CURSOR_SWEEP_MAX		32
+/* Minimum number of buckets to visit during cursor sweep. */
+#define	WT_SESSION_CURSOR_SWEEP_MIN		5
 
+/* Maximum number of buckets to visit during cursor sweep. */
+#define	WT_SESSION_CURSOR_SWEEP_MAX		32
 /*
  * WT_SESSION_IMPL --
  *	Implementation of WT_SESSION.
@@ -79,6 +81,7 @@ struct __wt_session_impl {
 	WT_CURSOR_LIST cursors;		/* Cursors closed with the session */
 	uint32_t cursor_sweep_position;	/* Position in cursor_cache for sweep */
 	uint32_t cursor_sweep_countdown;/* Countdown to cursor sweep */
+	time_t last_cursor_sweep;	/* Last sweep for dead cursors */
 
 	WT_CURSOR_BACKUP *bkp_cursor;	/* Hot backup cursor */
 
@@ -209,10 +212,11 @@ struct __wt_session_impl {
 
 					/* Generations manager */
 #define	WT_GEN_CHECKPOINT	0	/* Checkpoint generation */
-#define	WT_GEN_EVICT		1	/* Eviction generation */
-#define	WT_GEN_HAZARD		2	/* Hazard pointer */
-#define	WT_GEN_SPLIT		3	/* Page splits */
-#define	WT_GENERATIONS		4	/* Total generation manager entries */
+#define	WT_GEN_COMMIT		1	/* Commit generation */
+#define	WT_GEN_EVICT		2	/* Eviction generation */
+#define	WT_GEN_HAZARD		3	/* Hazard pointer */
+#define	WT_GEN_SPLIT		4	/* Page splits */
+#define	WT_GENERATIONS		5	/* Total generation manager entries */
 	volatile uint64_t generations[WT_GENERATIONS];
 
 	/*

@@ -36,6 +36,9 @@
 
 #include "mongo/base/initializer.h"
 #include "mongo/client/connection_string.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_registrar.h"
+#include "mongo/transport/transport_layer_asio.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
 #include "mongo/util/options_parser/environment.h"
@@ -69,7 +72,6 @@ ConnectionString getFixtureConnectionString() {
 int main(int argc, char** argv, char** envp) {
     setupSynchronousSignalHandlers();
     runGlobalInitializersOrDie(argc, argv, envp);
-
     quickExit(unittest::Suite::run(std::vector<std::string>(), "", 1));
 }
 

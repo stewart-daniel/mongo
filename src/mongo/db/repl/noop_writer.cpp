@@ -31,6 +31,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -142,7 +143,8 @@ void NoopWriter::stopWritingPeriodicNoops() {
 void NoopWriter::_writeNoop(OperationContext* opCtx) {
     // Use GlobalLock + lockMMAPV1Flush instead of DBLock to allow return when the lock is not
     // available. It may happen when the primary steps down and a shared global lock is acquired.
-    Lock::GlobalLock lock(opCtx, MODE_IX, Date_t::now() + Milliseconds(1));
+    Lock::GlobalLock lock(
+        opCtx, MODE_IX, Date_t::now() + Milliseconds(1), Lock::InterruptBehavior::kLeaveUnlocked);
     if (!lock.isLocked()) {
         LOG(1) << "Global lock is not available skipping noopWrite";
         return;
@@ -164,7 +166,7 @@ void NoopWriter::_writeNoop(OperationContext* opCtx) {
                << " != last primary OpTime: " << lastAppliedOpTime;
     } else {
         if (writePeriodicNoops.load()) {
-            const auto logLevel = Command::testCommandsEnabled ? 0 : 1;
+            const auto logLevel = getTestCommandsEnabled() ? 0 : 1;
             LOG(logLevel)
                 << "Writing noop to oplog as there has been no writes to this replica set in over "
                 << _writeInterval;

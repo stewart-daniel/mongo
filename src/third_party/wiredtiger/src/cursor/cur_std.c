@@ -672,8 +672,11 @@ __wt_cursor_cache_release(WT_SESSION_IMPL *session, WT_CURSOR *cursor,
 	 * Do any sweeping first, if there are errors, it will
 	 * be easier to clean up if the cursor is not already cached.
 	 */
-	if (--session->cursor_sweep_countdown == 0)
+	if (--session->cursor_sweep_countdown == 0) {
+		session->cursor_sweep_countdown =
+		    WT_SESSION_CURSOR_SWEEP_COUNTDOWN;
 		WT_RET(__wt_session_cursor_cache_sweep(session));
+	}
 
 	WT_ERR(cursor->cache(cursor));
 	WT_STAT_CONN_INCR(session, cursor_cache);
@@ -701,20 +704,31 @@ err:		WT_TRET(cursor->reopen(cursor, false));
  */
 int
 __wt_cursor_cache_get(WT_SESSION_IMPL *session, const char *uri,
-    WT_CURSOR *owner, const char *cfg[], WT_CURSOR **cursorp)
+    WT_CURSOR *to_dup, const char *cfg[], WT_CURSOR **cursorp)
 {
 	WT_CONFIG_ITEM cval;
-	WT_CONFIG_ITEM_STATIC_INIT(false_value);
 	WT_CURSOR *cursor;
 	WT_DECL_RET;
 	uint64_t bucket, hash_value;
+	uint32_t overwrite_flag;
 	bool have_config;
 
-	if (owner != NULL && F_ISSET(owner, WT_CURSTD_CACHEABLE))
+	if (!F_ISSET(session, WT_SESSION_CACHE_CURSORS))
 		return (WT_NOTFOUND);
-	have_config = (cfg != NULL && cfg[0] != NULL && cfg[1] != NULL);
-	if (have_config) {
 
+	/* If original config string is NULL or "", don't check it. */
+	have_config = (cfg != NULL && cfg[0] != NULL && cfg[1] != NULL &&
+	    (cfg[2] != NULL || cfg[1][0] != '\0'));
+
+	/* Fast path overwrite configuration */
+	if (have_config && cfg[2] == NULL &&
+	    WT_STREQ(cfg[1], "overwrite=false")) {
+		have_config = false;
+		overwrite_flag = 0;
+	} else
+		overwrite_flag = WT_CURSTD_OVERWRITE;
+
+	if (have_config) {
 		/*
 		 * Any cursors that have special configuration cannot
 		 * be cached. There are some exceptions for configurations
@@ -739,36 +753,34 @@ __wt_cursor_cache_get(WT_SESSION_IMPL *session, const char *uri,
 		if (cval.val)
 			return (WT_NOTFOUND);
 
-		/*
-		 * Look for checkpoint last, the value will stay in 'cval'.
-		 */
-		WT_RET_NOTFOUND_OK(
-		    __wt_config_gets_def(session, cfg, "checkpoint", 0, &cval));
-
-		/*
-		 * The internal checkpoint name is special, don't
-		 * look for it.
-		 */
-		if (cval.len != 0 &&
-		    WT_STRING_MATCH(WT_CHECKPOINT, cval.str, cval.len))
+		/* Checkpoints are readonly, we won't cache them. */
+		WT_RET(__wt_config_gets_def(
+		    session, cfg, "checkpoint", 0, &cval));
+		if (cval.val)
 			return (WT_NOTFOUND);
-	} else
-		cval = false_value;
+	}
 
-#define	CHECKPOINT_MATCH(s)						\
-	((s == NULL && cval.len == 0) ||				\
-	    (s != NULL && WT_STRING_MATCH(s, cval.str, cval.len)))
+	/*
+	 * Caller guarantees that exactly one of the URI and the
+	 * duplicate cursor is non-NULL.
+	 */
+	if (to_dup != NULL) {
+		WT_ASSERT(session, uri == NULL);
+		uri = to_dup->uri;
+		hash_value = to_dup->uri_hash;
+	} else {
+		WT_ASSERT(session, uri != NULL);
+		hash_value = __wt_hash_city64(uri, strlen(uri));
+	}
 
 	/*
 	 * Walk through all cursors, if there is a cached
 	 * cursor that matches uri and configuration, use it.
 	 */
-	hash_value = __wt_hash_city64(uri, strlen(uri));
 	bucket = hash_value % WT_HASH_ARRAY_SIZE;
 	TAILQ_FOREACH(cursor, &session->cursor_cache[bucket], q) {
 		if (cursor->uri_hash == hash_value &&
-		    WT_STREQ(cursor->uri, uri) &&
-		    CHECKPOINT_MATCH(cursor->checkpoint)) {
+		    WT_STREQ(cursor->uri, uri)) {
 			if ((ret = cursor->reopen(cursor, false)) != 0) {
 				F_CLR(cursor, WT_CURSTD_CACHEABLE);
 				session->dhandle = NULL;
@@ -776,25 +788,32 @@ __wt_cursor_cache_get(WT_SESSION_IMPL *session, const char *uri,
 				return (ret);
 			}
 
-			F_CLR(cursor, WT_CURSTD_APPEND | WT_CURSTD_OVERWRITE |
-			    WT_CURSTD_RAW);
+			/*
+			 * For these configuration values, there
+			 * is no difference in the resulting
+			 * cursor other than flag values, so fix
+			 * them up according to the given configuration.
+			 */
+			F_CLR(cursor, WT_CURSTD_APPEND | WT_CURSTD_RAW |
+			    WT_CURSTD_OVERWRITE);
+			F_SET(cursor, overwrite_flag);
 
 			if (have_config) {
 				/*
-				 * For these configuration values, there
-				 * is no difference in the resulting
-				 * cursor other than flag values, so fix
-				 * them up now.
+				 * The append flag is only relevant to
+				 * column stores.
 				 */
-				WT_RET(__wt_config_gets_def(
-				    session, cfg, "append", 0, &cval));
-				if (cval.val != 0)
-					F_SET(cursor, WT_CURSTD_APPEND);
+				if (WT_CURSOR_RECNO(cursor)) {
+					WT_RET(__wt_config_gets_def(
+					    session, cfg, "append", 0, &cval));
+					if (cval.val != 0)
+						F_SET(cursor, WT_CURSTD_APPEND);
+				}
 
 				WT_RET(__wt_config_gets_def(
 				    session, cfg, "overwrite", 1, &cval));
-				if (cval.val != 0)
-					F_SET(cursor, WT_CURSTD_OVERWRITE);
+				if (cval.val == 0)
+					F_CLR(cursor, WT_CURSTD_OVERWRITE);
 
 				WT_RET(__wt_config_gets_def(
 				    session, cfg, "raw", 0, &cval));

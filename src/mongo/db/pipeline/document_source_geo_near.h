@@ -33,7 +33,7 @@
 
 namespace mongo {
 
-class DocumentSourceGeoNear : public DocumentSource, public SplittableDocumentSource {
+class DocumentSourceGeoNear : public DocumentSource, public NeedsMergerDocumentSource {
 public:
     static const long long kDefaultLimit;
 
@@ -54,7 +54,8 @@ public:
                                      PositionRequirement::kFirst,
                                      HostTypeRequirement::kAnyShard,
                                      DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kNotAllowed);
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -66,7 +67,7 @@ public:
             {BSON(distanceField->fullPath() << -1)});
     }
 
-    // Virtuals for SplittableDocumentSource
+    // Virtuals for NeedsMergerDocumentSource
     boost::intrusive_ptr<DocumentSource> getShardSource() final;
     std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final;
 

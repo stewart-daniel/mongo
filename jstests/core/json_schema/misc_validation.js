@@ -23,8 +23,10 @@
 (function() {
     "use strict";
 
-    // For isMMAPv1.
+    // For isWiredTiger.
     load("jstests/concurrency/fsm_workload_helpers/server_types.js");
+    // For isReplSet
+    load("jstests/libs/fixture_helpers.js");
 
     const testName = "json_schema_misc_validation";
     const testDB = db.getSiblingDB(testName);
@@ -319,9 +321,11 @@
         coll.drop();
         assert.writeOK(coll.insert({_id: 1, a: true}));
 
-        if (!isMMAPv1(db)) {
+        if (FixtureHelpers.isReplSet(db) && !isMongos && isWiredTiger(db)) {
             // Test $jsonSchema in the precondition checking for doTxn.
-            res = testDB.adminCommand({
+            const session = db.getMongo().startSession();
+            const sessionDb = session.getDatabase(testDB.getName());
+            res = sessionDb.adminCommand({
                 doTxn: [
                     {op: "u", ns: coll.getFullName(), o2: {_id: 1}, o: {$set: {a: false}}},
                 ],
@@ -329,7 +333,8 @@
                     ns: coll.getFullName(),
                     q: {$jsonSchema: {properties: {a: {type: "boolean"}}}},
                     res: {a: true}
-                }]
+                }],
+                txnNumber: NumberLong("0")
             });
             assert.commandWorked(res);
             assert.eq(1, res.applied);

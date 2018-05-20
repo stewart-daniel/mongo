@@ -38,7 +38,7 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/timer_stats.h"
@@ -67,12 +67,11 @@ bool commandSpecifiesWriteConcern(const BSONObj& cmdObj) {
 }
 
 StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
-                                                    const BSONObj& cmdObj,
-                                                    const std::string& dbName) {
+                                                    const BSONObj& cmdObj) {
     // The default write concern if empty is {w:1}. Specifying {w:0} is/was allowed, but is
     // interpreted identically to {w:1}.
     auto wcResult = WriteConcernOptions::extractWCFromCommand(
-        cmdObj, dbName, repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault());
+        cmdObj, repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault());
     if (!wcResult.isOK()) {
         return wcResult.getStatus();
     }
@@ -88,7 +87,7 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
                 WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(30)};
         }
     } else {
-        Status wcStatus = validateWriteConcern(opCtx, writeConcern, dbName);
+        Status wcStatus = validateWriteConcern(opCtx, writeConcern);
         if (!wcStatus.isOK()) {
             return wcStatus;
         }
@@ -97,11 +96,9 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
     return writeConcern;
 }
 
-Status validateWriteConcern(OperationContext* opCtx,
-                            const WriteConcernOptions& writeConcern,
-                            StringData dbName) {
+Status validateWriteConcern(OperationContext* opCtx, const WriteConcernOptions& writeConcern) {
     if (writeConcern.syncMode == WriteConcernOptions::SyncMode::JOURNAL &&
-        !opCtx->getServiceContext()->getGlobalStorageEngine()->isDurable()) {
+        !opCtx->getServiceContext()->getStorageEngine()->isDurable()) {
         return Status(ErrorCodes::BadValue,
                       "cannot use 'j' option when a host does not have journaling enabled");
     }
@@ -186,7 +183,7 @@ Status waitForWriteConcern(OperationContext* opCtx,
         case WriteConcernOptions::SyncMode::NONE:
             break;
         case WriteConcernOptions::SyncMode::FSYNC: {
-            StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+            StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
             if (!storageEngine->isDurable()) {
                 result->fsyncFiles = storageEngine->flushAllFiles(opCtx, true);
             } else {

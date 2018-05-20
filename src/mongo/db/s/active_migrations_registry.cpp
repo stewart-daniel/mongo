@@ -30,19 +30,31 @@
 
 #include "mongo/db/s/active_migrations_registry.h"
 
-#include "mongo/base/status_with.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/migration_source_manager.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
+namespace {
+
+const auto getRegistry = ServiceContext::declareDecoration<ActiveMigrationsRegistry>();
+
+}  // namespace
 
 ActiveMigrationsRegistry::ActiveMigrationsRegistry() = default;
 
 ActiveMigrationsRegistry::~ActiveMigrationsRegistry() {
     invariant(!_activeMoveChunkState);
+}
+
+ActiveMigrationsRegistry& ActiveMigrationsRegistry::get(ServiceContext* service) {
+    return getRegistry(service);
+}
+
+ActiveMigrationsRegistry& ActiveMigrationsRegistry::get(OperationContext* opCtx) {
+    return get(opCtx->getServiceContext());
 }
 
 StatusWith<ScopedDonateChunk> ActiveMigrationsRegistry::registerDonateChunk(
@@ -108,9 +120,9 @@ BSONObj ActiveMigrationsRegistry::getActiveMigrationStatusReport(OperationContex
         // Lock the collection so nothing changes while we're getting the migration report.
         AutoGetCollection autoColl(opCtx, nss.get(), MODE_IS);
 
-        auto css = CollectionShardingState::get(opCtx, nss.get());
-        if (css->getMigrationSourceManager()) {
-            return css->getMigrationSourceManager()->getMigrationStatusReport();
+        if (auto msm =
+                MigrationSourceManager::get(CollectionShardingState::get(opCtx, nss.get()))) {
+            return msm->getMigrationStatusReport();
         }
     }
 

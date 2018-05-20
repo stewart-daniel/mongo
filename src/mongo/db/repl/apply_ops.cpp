@@ -48,7 +48,7 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collation_spec.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/fail_point_service.h"
@@ -77,7 +77,7 @@ bool _parseAreOpsCrudOnly(const BSONObj& applyOpCmd) {
         BSONElement& fieldOp = fields[1];
 
         const char* opType = fieldOp.valuestrsafe();
-        const StringData ns = fieldNs.valueStringData();
+        const StringData ns = fieldNs.valuestrsafe();
 
         // All atomic ops have an opType of length 1.
         if (opType[0] == '\0' || opType[1] != '\0')
@@ -137,7 +137,7 @@ Status _applyOps(OperationContext* opCtx,
             invariant(opCtx->lockState()->isW());
             invariant(*opType != 'c');
 
-            auto db = dbHolder().get(opCtx, nss.ns());
+            auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.ns());
             if (!db) {
                 // Retry in non-atomic mode, since MMAP cannot implicitly create a new database
                 // within an active WriteUnitOfWork.
@@ -301,7 +301,7 @@ Status _applyOps(OperationContext* opCtx,
             // lock or any database locks. We release all locks temporarily while the fail
             // point is enabled to allow other threads to make progress.
             boost::optional<Lock::TempRelease> release;
-            auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+            auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
             if (storageEngine->isMmapV1() && !opCtx->lockState()->isW()) {
                 release.emplace(opCtx->lockState());
             }
@@ -339,7 +339,7 @@ Status _checkPrecondition(OperationContext* opCtx,
         BSONObj realres = db.findOne(nss.ns(), preCondition["q"].Obj());
 
         // Get collection default collation.
-        Database* database = dbHolder().get(opCtx, nss.db());
+        Database* database = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.db());
         if (!database) {
             return {ErrorCodes::NamespaceNotFound, "database in ns does not exist: " + nss.ns()};
         }
@@ -443,8 +443,7 @@ Status applyOps(OperationContext* opCtx,
         writeConflictRetry(opCtx, "applyOps", dbName, [&] {
             BSONObjBuilder intermediateResult;
             std::unique_ptr<BSONArrayBuilder> opsBuilder;
-            if (opCtx->writesAreReplicated() &&
-                repl::ReplicationCoordinator::modeMasterSlave != replCoord->getReplicationMode()) {
+            if (opCtx->writesAreReplicated()) {
                 opsBuilder = stdx::make_unique<BSONArrayBuilder>();
             }
             WriteUnitOfWork wunit(opCtx);

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "mongo/base/clonable_ptr.h"
+#include "mongo/base/shim.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
@@ -76,20 +77,20 @@ public:
             virtual IndexCatalogEntry* catalogEntry(const IndexDescriptor* desc) = 0;
         };
 
-    private:
-        static std::unique_ptr<Impl> makeImpl(OperationContext* opCtx,
-                                              const IndexCatalog* cat,
-                                              bool includeUnfinishedIndexes);
+        static MONGO_DECLARE_SHIM((OperationContext * opCtx,
+                                   const IndexCatalog* cat,
+                                   bool includeUnfinishedIndexes,
+                                   PrivateTo<IndexIterator>)
+                                      ->std::unique_ptr<Impl>) makeImpl;
 
+    private:
         explicit inline IndexIterator(OperationContext* const opCtx,
                                       const IndexCatalog* const cat,
                                       const bool includeUnfinishedIndexes)
-            : _pimpl(makeImpl(opCtx, cat, includeUnfinishedIndexes)) {}
+            : _pimpl(makeImpl(opCtx, cat, includeUnfinishedIndexes, PrivateCall<IndexIterator>{})) {
+        }
 
     public:
-        using factory_function_type = stdx::function<decltype(makeImpl)>;
-        static void registerFactory(factory_function_type factory);
-
         inline ~IndexIterator() = default;
 
         inline IndexIterator(const IndexIterator& copy) = default;
@@ -161,8 +162,7 @@ public:
 
         virtual bool haveIdIndex(OperationContext* opCtx) const = 0;
 
-        virtual BSONObj getDefaultIdIndexSpec(ServerGlobalParams::FeatureCompatibility::Version
-                                                  featureCompatibilityVersion) const = 0;
+        virtual BSONObj getDefaultIdIndexSpec() const = 0;
 
         virtual IndexDescriptor* findIdIndex(OperationContext* opCtx) const = 0;
 
@@ -207,9 +207,10 @@ public:
         virtual StatusWith<BSONObj> prepareSpecForCreate(OperationContext* opCtx,
                                                          const BSONObj& original) const = 0;
 
-        virtual void dropAllIndexes(OperationContext* opCtx,
-                                    bool includingIdIndex,
-                                    std::map<std::string, BSONObj>* droppedIndexes) = 0;
+        virtual void dropAllIndexes(
+            OperationContext* opCtx,
+            bool includingIdIndex,
+            stdx::function<void(const IndexDescriptor*)> onDropFn = nullptr) = 0;
 
         virtual Status dropIndex(OperationContext* opCtx, IndexDescriptor* desc) = 0;
 
@@ -256,19 +257,17 @@ public:
         friend IndexCatalog;
     };
 
-private:
-    static std::unique_ptr<Impl> makeImpl(IndexCatalog* this_,
-                                          Collection* collection,
-                                          int maxNumIndexesAllowed);
-
 public:
-    using factory_function_type = stdx::function<decltype(makeImpl)>;
-    static void registerFactory(factory_function_type factory);
+    static MONGO_DECLARE_SHIM((IndexCatalog * this_,
+                               Collection* collection,
+                               int maxNumIndexesAllowed,
+                               PrivateTo<IndexCatalog>)
+                                  ->std::unique_ptr<Impl>) makeImpl;
 
     inline ~IndexCatalog() = default;
 
     explicit inline IndexCatalog(Collection* const collection, const int maxNumIndexesAllowed)
-        : _pimpl(makeImpl(this, collection, maxNumIndexesAllowed)) {}
+        : _pimpl(makeImpl(this, collection, maxNumIndexesAllowed, PrivateCall<IndexCatalog>{})) {}
 
     inline IndexCatalog(IndexCatalog&&) = delete;
     inline IndexCatalog& operator=(IndexCatalog&&) = delete;
@@ -312,9 +311,8 @@ public:
     /**
      * Returns the spec for the id index to create by default for this collection.
      */
-    inline BSONObj getDefaultIdIndexSpec(
-        const ServerGlobalParams::FeatureCompatibility::Version featureCompatibilityVersion) const {
-        return this->_impl().getDefaultIdIndexSpec(featureCompatibilityVersion);
+    inline BSONObj getDefaultIdIndexSpec() const {
+        return this->_impl().getDefaultIdIndexSpec();
     }
 
     inline IndexDescriptor* findIdIndex(OperationContext* const opCtx) const {
@@ -451,13 +449,13 @@ public:
 
     /**
      * Drops all indexes in the index catalog, optionally dropping the id index depending on the
-     * 'includingIdIndex' parameter value. If the 'droppedIndexes' parameter is not null,
-     * it is filled with the names and index info of the dropped indexes.
+     * 'includingIdIndex' parameter value. If 'onDropFn' is provided, it will be called before each
+     * index is dropped to allow timestamping each individual drop.
      */
-    inline void dropAllIndexes(OperationContext* const opCtx,
-                               const bool includingIdIndex,
-                               std::map<std::string, BSONObj>* const droppedIndexes = nullptr) {
-        this->_impl().dropAllIndexes(opCtx, includingIdIndex, droppedIndexes);
+    inline void dropAllIndexes(OperationContext* opCtx,
+                               bool includingIdIndex,
+                               stdx::function<void(const IndexDescriptor*)> onDropFn = nullptr) {
+        this->_impl().dropAllIndexes(opCtx, includingIdIndex, onDropFn);
     }
 
     inline Status dropIndex(OperationContext* const opCtx, IndexDescriptor* const desc) {
@@ -540,18 +538,15 @@ public:
 
     // public static helpers
 
-    static BSONObj fixIndexKey(const BSONObj& key);
-    static void registerFixIndexKeyImpl(stdx::function<decltype(fixIndexKey)> impl);
+    static MONGO_DECLARE_SHIM((const BSONObj& key)->BSONObj) fixIndexKey;
 
     /**
      * Fills out 'options' in order to indicate whether to allow dups or relax
      * index constraints, as needed by replication.
      */
-    static void prepareInsertDeleteOptions(OperationContext* opCtx,
-                                           const IndexDescriptor* desc,
-                                           InsertDeleteOptions* options);
-    static void registerPrepareInsertDeleteOptionsImpl(
-        stdx::function<decltype(prepareInsertDeleteOptions)> impl);
+    static MONGO_DECLARE_SHIM(
+        (OperationContext * opCtx, const IndexDescriptor* desc, InsertDeleteOptions* options)->void)
+        prepareInsertDeleteOptions;
 
 private:
     inline const Collection* _getCollection() const {

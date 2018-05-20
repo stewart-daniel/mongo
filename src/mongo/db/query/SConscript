@@ -116,6 +116,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "query_test_service_context",
+        "$BUILD_DIR/mongo/db/auth/authmocks",
         "$BUILD_DIR/mongo/db/query_exec",
         "$BUILD_DIR/mongo/db/serveronly",
         "$BUILD_DIR/mongo/db/service_context_d",
@@ -187,7 +188,8 @@ env.Library(
     target="query_request",
     source=[
         "query_request.cpp",
-        "tailable_mode.cpp"
+        "tailable_mode.cpp",
+        env.Idlc("tailable_mode.idl")[0],
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
@@ -397,6 +399,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "query_planner_test_fixture",
+        "$BUILD_DIR/mongo/db/auth/authmocks",
         "$BUILD_DIR/mongo/db/query_exec",
         "$BUILD_DIR/mongo/db/serveronly",
         "$BUILD_DIR/mongo/db/service_context_d",

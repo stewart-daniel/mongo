@@ -57,12 +57,14 @@ public:
                                                    ShouldFailRequestFn shouldFailRequest)
         : unittest::TaskExecutorProxy(executor), _shouldFailRequest(shouldFailRequest) {}
 
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb) override {
+    StatusWith<CallbackHandle> scheduleRemoteCommand(
+        const executor::RemoteCommandRequest& request,
+        const RemoteCommandCallbackFn& cb,
+        const transport::BatonHandle& baton = nullptr) override {
         if (_shouldFailRequest(request)) {
             return Status(ErrorCodes::OperationFailed, "failed to schedule remote command");
         }
-        return getExecutor()->scheduleRemoteCommand(request, cb);
+        return getExecutor()->scheduleRemoteCommand(request, cb, baton);
     }
 
 private:
@@ -307,6 +309,7 @@ BSONObj _makeOplogEntry(Timestamp ts, long long term) {
                       BSONObj(),                        // o
                       boost::none,                      // o2
                       {},                               // sessionInfo
+                      boost::none,                      // upsert
                       boost::none,                      // wall clock time
                       boost::none,                      // statement id
                       boost::none,  // optime of previous write within same transaction

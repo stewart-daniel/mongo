@@ -29,78 +29,67 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/s/commands/cluster_commands_helpers.h"
 
 namespace mongo {
-/**
- * Forwards the testing-only restartCatalog command to all shards.
- */
-class ClusterRestartCatalogCmd final : public BasicCommand {
+namespace {
+
+class ClusterRestartCatalogCmd : public BasicCommand {
 public:
     ClusterRestartCatalogCmd() : BasicCommand("restartCatalog") {}
 
+    std::string help() const override {
+        return "Internal command for testing only. Forwards the restartCatalog command to all "
+               "shards.";
+    }
+
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
-                                 const BSONObj& cmdObj) const final {
+                                 const BSONObj& cmdObj) const override {
         // No auth checks as this is a testing-only command.
         return Status::OK();
     }
 
-    bool adminOnly() const final {
+    bool adminOnly() const override {
         return true;
     }
 
-    bool maintenanceMode() const final {
+    bool maintenanceMode() const override {
         return true;
     }
 
-    bool maintenanceOk() const final {
+    bool maintenanceOk() const override {
         return false;
     }
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const final {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
-    }
-
-    std::string help() const final {
-        return "restart catalog\n"
-               "Internal command for testing only. Forwards the restartCatalog command to\n"
-               "all shards.\n";
     }
 
     bool run(OperationContext* opCtx,
              const std::string& db,
              const BSONObj& cmdObj,
-             BSONObjBuilder& result) final {
-        // This command doesn't operate on a collection namespace, so just pass in an empty
-        // NamespaceString.
-        const auto namespaceStringForCommand = boost::none;
+             BSONObjBuilder& result) override {
         auto shardResponses = scatterGatherUnversionedTargetAllShards(
             opCtx,
             db,
-            namespaceStringForCommand,
             CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
             ReadPreferenceSetting::get(opCtx),
             Shard::RetryPolicy::kIdempotent);
 
-        std::string errmsg;
-        appendRawResponses(opCtx, &errmsg, &result, shardResponses);
-
         // Intentionally not adding the error message to 'result', as it will already contain all
         // the errors from the shards in a field named 'raw'.
-        return errmsg.length() > 0 ? false : true;
+        std::string errmsg;
+        return appendRawResponses(opCtx, &errmsg, &result, shardResponses);
     }
 };
 
-MONGO_INITIALIZER(RegisterClusterRestartCatalogCommand)(InitializerContext* ctx) {
-    if (Command::testCommandsEnabled) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new ClusterRestartCatalogCmd();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(ClusterRestartCatalogCmd);
+
+}  // namespace
 }  // namespace mongo

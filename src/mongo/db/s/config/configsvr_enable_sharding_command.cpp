@@ -39,6 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
@@ -99,11 +100,13 @@ public:
              BSONObjBuilder& result) {
 
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation,
-                       "_configsvrEnableSharding can only be run on config servers"));
+            uasserted(ErrorCodes::IllegalOperation,
+                      "_configsvrEnableSharding can only be run on config servers");
         }
+
+        // Set the operation context read concern level to local for reads into the config database.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
         const std::string dbname = parseNs("", cmdObj);
 
@@ -113,10 +116,8 @@ public:
             NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
 
         if (dbname == NamespaceString::kAdminDb || dbname == NamespaceString::kLocalDb) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                {ErrorCodes::InvalidOptions,
-                 str::stream() << "can't shard " + dbname + " database"});
+            uasserted(ErrorCodes::InvalidOptions,
+                      str::stream() << "can't shard " + dbname + " database");
         }
 
         uassert(ErrorCodes::InvalidOptions,
@@ -127,15 +128,9 @@ public:
         // Make sure to force update of any stale metadata
         ON_BLOCK_EXIT([opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
 
-        // Remove the backwards compatible lock after 3.6 ships.
-        auto const catalogClient = Grid::get(opCtx)->catalogClient();
-        auto backwardsCompatibleDbDistLock = uassertStatusOK(
-            catalogClient->getDistLockManager()->lock(opCtx,
-                                                      dbname + "-movePrimary",
-                                                      "enableSharding",
-                                                      DistLockManager::kDefaultLockTimeout));
-        auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
-            opCtx, dbname, "enableSharding", DistLockManager::kDefaultLockTimeout));
+        auto dbDistLock =
+            uassertStatusOK(Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
+                opCtx, dbname, "enableSharding", DistLockManager::kDefaultLockTimeout));
 
         ShardingCatalogManager::get(opCtx)->enableSharding(opCtx, dbname);
         audit::logEnableSharding(Client::getCurrent(), dbname);

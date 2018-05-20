@@ -106,12 +106,17 @@ public:
     /**
      * Returns the user name for this user.
      */
-    const UserName& getName() const;
+    const UserName& getName() const {
+        return _name;
+    }
 
     /**
      * Returns a digest of the user's identity
      */
-    const SHA256Block& getDigest() const;
+    const SHA256Block& getDigest() const {
+        return _digest;
+    }
+
 
     /**
      * Returns an iterator over the names of the user's direct roles
@@ -144,6 +149,11 @@ public:
      * Gets the set of actions this user is allowed to perform on the given resource.
      */
     const ActionSet getActionsForResource(const ResourcePattern& resource) const;
+
+    /**
+     * Returns true if the user has is allowed to perform an action on the given resource.
+     */
+    bool hasActionsForResource(const ResourcePattern& resource) const;
 
     /**
      * Returns true if this copy of information about this user is still valid. If this returns

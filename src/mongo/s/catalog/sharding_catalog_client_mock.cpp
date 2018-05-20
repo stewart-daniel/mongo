@@ -79,6 +79,11 @@ StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientMock::getDatabas
     return {ErrorCodes::InternalError, "Method not implemented"};
 }
 
+StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> ShardingCatalogClientMock::getAllDBs(
+    OperationContext* opCtx, repl::ReadConcernLevel readConcern) {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
 StatusWith<repl::OpTimeWith<CollectionType>> ShardingCatalogClientMock::getCollection(
     OperationContext* opCtx, const NamespaceString& nss, repl::ReadConcernLevel readConcernLevel) {
     return {ErrorCodes::InternalError, "Method not implemented"};
@@ -90,6 +95,11 @@ StatusWith<std::vector<CollectionType>> ShardingCatalogClientMock::getCollection
     repl::OpTime* optime,
     repl::ReadConcernLevel readConcernLevel) {
     return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
+std::vector<NamespaceString> ShardingCatalogClientMock::getAllShardedCollectionsForDb(
+    OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) {
+    return {};
 }
 
 StatusWith<std::vector<std::string>> ShardingCatalogClientMock::getDatabasesForShard(

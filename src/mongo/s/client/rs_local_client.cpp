@@ -107,7 +107,8 @@ StatusWith<Shard::QueryResponse> RSLocalClient::queryOnce(
 
     if (readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern) {
         // Set up operation context with majority read snapshot so correct optime can be retrieved.
-        Status status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
+        Status status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
 
         // Wait for any writes performed by this ShardLocal instance to be committed and visible.
         Status readConcernStatus = replCoord->waitUntilOpTimeForRead(
@@ -118,7 +119,7 @@ StatusWith<Shard::QueryResponse> RSLocalClient::queryOnce(
 
         // Inform the storage engine to read from the committed snapshot for the rest of this
         // operation.
-        status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+        status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
         if (!status.isOK()) {
             return status;
         }

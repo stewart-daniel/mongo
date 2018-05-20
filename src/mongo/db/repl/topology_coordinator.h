@@ -355,6 +355,10 @@ public:
         unsigned selfUptime;
         const OpTime& readConcernMajorityOpTime;
         const BSONObj& initialSyncStatus;
+
+        // boost::none if the storage engine does not support recovering to a
+        // timestamp. Timestamp::min() if a stable checkpoint is yet to be taken.
+        const boost::optional<Timestamp> lastStableCheckpointTimestamp;
     };
 
     // produce a reply to a status request
@@ -472,9 +476,7 @@ public:
      * "durablyWritten" indicates whether the operation has to be durably applied.
      * "skipSelf" means to exclude this node whether or not the op has been applied.
      */
-    std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op,
-                                               bool durablyWritten,
-                                               bool skipSelf);
+    std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten);
 
     /**
      * Marks a member as down from our perspective and returns a bool which indicates if we can no
@@ -543,26 +545,6 @@ public:
     StatusWith<bool> setLastOptime(const UpdatePositionArgs::UpdateInfo& args,
                                    Date_t now,
                                    long long* configVersion);
-    /*
-     * Sets the last optimes for a slave node.
-     *
-     * Used only in master/slave replication.
-     */
-
-    void setLastOptimeForSlave(const OID& rid, const OpTime& opTime, Date_t now);
-
-    /*
-     * Set the RID for this node.
-     *
-     * Used only in master/slave replication.
-     */
-    void setMyRid(const OID& rid);
-
-    /**
-     * Process a handshake command, adding the slave to the member list if it isn't already there.
-     * Used only in master/slave mode
-     */
-    Status processHandshake(const OID& rid, const HostAndPort& hostAndPort);
 
     /**
      * If getRole() == Role::candidate and this node has not voted too recently, updates the
@@ -604,8 +586,9 @@ public:
      * Readies the TopologyCoordinator for an attempt to stepdown that may fail.  This is used
      * when we receive a stepdown command (which can fail if not enough secondaries are caught up)
      * to ensure that we never process more than one stepdown request at a time.
-     * Returns OK if it is safe to continue with the stepdown attempt, or returns
-     * ConflictingOperationInProgess if this node is already processing a stepdown request of any
+     * Returns OK if it is safe to continue with the stepdown attempt, or returns:
+     * - NotMaster if this node is not a leader.
+     * - ConflictingOperationInProgess if this node is already processing a stepdown request of any
      * kind.
      */
     Status prepareForStepDownAttempt();
@@ -768,7 +751,8 @@ public:
     // Sets _currentPrimaryIndex to the given index.  Should only be used in unit tests!
     // TODO(spencer): Remove this once we can easily call for an election in unit tests to
     // set the current primary.
-    void _setCurrentPrimaryForTest(int primaryIndex);
+    void setCurrentPrimary_forTest(int primaryIndex,
+                                   const Timestamp& electionTime = Timestamp(0, 0));
 
     // Returns _electionTime.  Only used in unittests.
     Timestamp getElectionTime() const;
@@ -874,13 +858,6 @@ private:
      * nullptr if memberId is not found in the configuration.
      */
     MemberData* _findMemberDataByMemberId(const int memberId);
-
-    /*
-     * Returns information we have on the state of the node identified by rid.  Returns
-     * nullptr if rid is not found in the heartbeat data.  This method is used only for
-     * master/slave replication.
-     */
-    MemberData* _findMemberDataByRid(const OID rid);
 
     // Returns NULL if there is no primary, or the MemberConfig* for the current primary
     const MemberConfig* _currentPrimaryMember() const;

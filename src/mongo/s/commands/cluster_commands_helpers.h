@@ -54,6 +54,22 @@ void appendWriteConcernErrorToCmdResponse(const ShardId& shardID,
 BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version);
 
 /**
+ * Returns a copy of 'cmdObj' with 'allowImplicitCollectionCreation' appended.
+ */
+BSONObj appendAllowImplicitCreate(BSONObj cmdObj, bool allow);
+
+/**
+ * Returns a copy of 'cmdObj' with atClusterTime appended to a readConcern.
+ */
+BSONObj appendAtClusterTime(BSONObj cmdObj, LogicalTime atClusterTime);
+
+/**
+ * Returns a copy of the given readConcern object with atClusterTime appended. The given object must
+ * not already have an atClusterTime field.
+ */
+BSONObj appendAtClusterTimeToReadConcern(BSONObj readConcernObj, LogicalTime atClusterTime);
+
+/**
  * Utility for dispatching unversioned commands to all shards in a cluster.
  *
  * Returns a non-OK status if a failure occurs on *this* node during execution. Otherwise, returns
@@ -68,8 +84,7 @@ BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version);
  */
 std::vector<AsyncRequestsSender::Response> scatterGatherUnversionedTargetAllShards(
     OperationContext* opCtx,
-    const std::string& dbName,
-    boost::optional<NamespaceString> nss,
+    StringData dbName,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy);
@@ -84,8 +99,9 @@ std::vector<AsyncRequestsSender::Response> scatterGatherUnversionedTargetAllShar
  */
 std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRoutingTable(
     OperationContext* opCtx,
-    const std::string& dbName,
+    StringData dbName,
     const NamespaceString& nss,
+    const CachedCollectionRoutingInfo& routingInfo,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
@@ -105,8 +121,21 @@ std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRouting
  */
 std::vector<AsyncRequestsSender::Response> scatterGatherOnlyVersionIfUnsharded(
     OperationContext* opCtx,
-    const std::string& dbName,
     const NamespaceString& nss,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy);
+
+/**
+ * Utility for dispatching commands against the primary of a database and attach the appropriate
+ * database version.
+ *
+ * Does not retry on StaleDbVersion.
+ */
+AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
+    OperationContext* opCtx,
+    StringData dbName,
+    const CachedDatabaseInfo& dbInfo,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy);
@@ -128,6 +157,19 @@ bool appendRawResponses(OperationContext* opCtx,
                         std::set<ErrorCodes::Error> ignoredErrors = {});
 
 /**
+ * Extracts the query from a query-embedding command ('query' or 'q' fields). If the command does
+ * not have an embedded query, returns an empty BSON object.
+ */
+BSONObj extractQuery(const BSONObj& cmdObj);
+
+/**
+ * Extracts the collation from a collation-embedding command ('collation' field). If the command
+ * does not specify a collation, returns an empty BSON object. If the 'collation' field is of wrong
+ * type, throws.
+ */
+BSONObj extractCollation(const BSONObj& cmdObj);
+
+/**
  * Utility function to compute a single error code from a vector of command results.
  *
  * @return If there is an error code common to all of the error results, returns that error
@@ -138,7 +180,10 @@ int getUniqueCodeFromCommandResults(const std::vector<Strategy::CommandResult>& 
 /**
  * Utility function to return an empty result set from a command.
  */
-bool appendEmptyResultSet(BSONObjBuilder& result, Status status, const std::string& ns);
+bool appendEmptyResultSet(OperationContext* opCtx,
+                          BSONObjBuilder& result,
+                          Status status,
+                          const std::string& ns);
 
 /**
  * If the specified database exists already, loads it in the cache (if not already there) and
@@ -146,4 +191,34 @@ bool appendEmptyResultSet(BSONObjBuilder& result, Status status, const std::stri
  */
 StatusWith<CachedDatabaseInfo> createShardDatabase(OperationContext* opCtx, StringData dbName);
 
+/**
+ * Returns the shards that would be targeted for the given query according to the given routing
+ * info.
+ */
+std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
+                                            const CachedCollectionRoutingInfo& routingInfo,
+                                            const BSONObj& query,
+                                            const BSONObj& collation);
+
+/**
+ * Returns the latest known lastCommittedOpTime for the targeted shard.
+ *
+ * A null logical time is returned if the readConcern on the OperationContext is not snapshot.
+ */
+boost::optional<LogicalTime> computeAtClusterTimeForOneShard(OperationContext* opCtx,
+                                                             const ShardId& shardId);
+
+/**
+ * Returns the atClusterTime to use for the given query. This will be the latest known
+ * lastCommittedOpTime for the targeted shards if the same set of shards would be targeted at that
+ * time, otherwise the latest in-memory cluster time.
+ *
+ * A null logical time is returned if the readConcern on the OperationContext is not snapshot.
+ */
+boost::optional<LogicalTime> computeAtClusterTime(OperationContext* opCtx,
+                                                  bool mustRunOnAll,
+                                                  const std::set<ShardId>& shardIds,
+                                                  const NamespaceString& nss,
+                                                  const BSONObj query,
+                                                  const BSONObj collation);
 }  // namespace mongo

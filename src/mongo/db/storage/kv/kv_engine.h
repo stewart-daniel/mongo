@@ -163,6 +163,10 @@ public:
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident) = 0;
 
+    virtual void alterIdentMetadata(OperationContext* opCtx,
+                                    StringData ident,
+                                    const IndexDescriptor* desc){};
+
     // optional
     virtual int flushAllFiles(OperationContext* opCtx, bool sync) {
         return 0;
@@ -271,9 +275,28 @@ public:
     /**
      * See `StorageEngine::recoverToStableTimestamp`
      */
-    virtual Status recoverToStableTimestamp() {
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) {
         fassertFailed(50664);
     }
+
+    /**
+     * See `StorageEngine::getRecoveryTimestamp`
+     */
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * See `StorageEngine::getLastStableCheckpointTimestamp`
+     */
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * See `StorageEngine::getAllCommittedTimestamp`
+     */
+    virtual Timestamp getAllCommittedTimestamp() const = 0;
 
     /**
      * See `StorageEngine::supportsReadConcernSnapshot`

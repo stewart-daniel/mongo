@@ -50,7 +50,6 @@
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -226,9 +225,7 @@ public:
             maybeDisableValidation.emplace(opCtx);
 
         auto status = OplogApplicationChecks::checkOperationArray(cmdObj.firstElement());
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
+        uassertStatusOK(status);
 
         // TODO (SERVER-30217): When a write concern is provided to the applyOps command, we
         // normally wait on the OpTime of whichever operation successfully completed last. This is
@@ -252,23 +249,19 @@ public:
             auto modeSW = repl::OplogApplication::parseMode(oplogApplicationModeString);
             if (!modeSW.isOK()) {
                 // Unable to parse the mode argument.
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    modeSW.getStatus().withContext(
-                        str::stream()
-                        << "Could not parse " + repl::ApplyOps::kOplogApplicationModeFieldName));
+                uassertStatusOK(modeSW.getStatus().withContext(
+                    str::stream() << "Could not parse " +
+                        repl::ApplyOps::kOplogApplicationModeFieldName));
             }
             oplogApplicationMode = modeSW.getValue();
         } else if (status != ErrorCodes::NoSuchKey) {
             // NoSuchKey means the user did not supply a mode.
-            return CommandHelpers::appendCommandStatus(
-                result,
-                status.withContext(str::stream()
-                                   << "Could not parse out "
-                                   << repl::ApplyOps::kOplogApplicationModeFieldName));
+            uassertStatusOK(status.withContext(str::stream()
+                                               << "Could not parse out "
+                                               << repl::ApplyOps::kOplogApplicationModeFieldName));
         }
 
-        auto applyOpsStatus = CommandHelpers::appendCommandStatus(
+        auto applyOpsStatus = CommandHelpers::appendCommandStatusNoThrow(
             result, repl::applyOps(opCtx, dbname, cmdObj, oplogApplicationMode, &result));
 
         return applyOpsStatus;

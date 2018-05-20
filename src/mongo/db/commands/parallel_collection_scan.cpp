@@ -129,8 +129,15 @@ public:
                 make_unique<MultiIteratorStage>(opCtx, ws.get(), collection);
 
             // Takes ownership of 'ws' and 'mis'.
+            const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
             auto statusWithPlanExecutor = PlanExecutor::make(
-                opCtx, std::move(ws), std::move(mis), collection, PlanExecutor::YIELD_AUTO);
+                opCtx,
+                std::move(ws),
+                std::move(mis),
+                collection,
+                readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
+                    ? PlanExecutor::INTERRUPT_ONLY
+                    : PlanExecutor::YIELD_AUTO);
             invariant(statusWithPlanExecutor.isOK());
             execs.push_back(std::move(statusWithPlanExecutor.getValue()));
         }
@@ -155,7 +162,7 @@ public:
                 {std::move(exec),
                  nss,
                  AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                 opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                 repl::ReadConcernArgs::get(opCtx).getLevel(),
                  cmdObj});
             pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
 

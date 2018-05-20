@@ -33,7 +33,7 @@
 #include "mongo/db/s/sharding_egress_metadata_hook_for_mongod.h"
 
 #include "mongo/base/status.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/s/grid.h"
 
@@ -50,7 +50,7 @@ repl::OpTime ShardingEgressMetadataHookForMongod::_getConfigServerOpTime() {
     } else {
         // TODO uncomment as part of SERVER-22663
         // invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
-        return grid.configOpTime();
+        return Grid::get(_serviceContext)->configOpTime();
     }
 }
 

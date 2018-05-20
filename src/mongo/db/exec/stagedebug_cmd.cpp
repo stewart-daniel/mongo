@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
@@ -209,12 +210,8 @@ public:
                     << PlanExecutor::statestr(state)
                     << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error during "
-                                     << "StageDebug command: "
-                                     << WorkingSetCommon::toStatusString(obj)));
+            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                "Executor error during StageDebug command"));
         }
 
         return true;
@@ -519,12 +516,6 @@ public:
     }
 };
 
-MONGO_INITIALIZER(RegisterStageDebugCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new StageDebugCmd();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(StageDebugCmd);
 
 }  // namespace mongo

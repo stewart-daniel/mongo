@@ -728,6 +728,7 @@ public:
 
     Value evaluate(const Document& root) const final;
     Value serialize(bool explain) const final;
+    boost::intrusive_ptr<Expression> optimize() final;
     const char* getOpName() const final;
 };
 
@@ -1218,13 +1219,39 @@ public:
 };
 
 
-class ExpressionIndexOfArray final : public ExpressionRangedArity<ExpressionIndexOfArray, 2, 4> {
+class ExpressionIndexOfArray : public ExpressionRangedArity<ExpressionIndexOfArray, 2, 4> {
 public:
     explicit ExpressionIndexOfArray(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : ExpressionRangedArity<ExpressionIndexOfArray, 2, 4>(expCtx) {}
 
-    Value evaluate(const Document& root) const final;
+
+    Value evaluate(const Document& root) const;
+    boost::intrusive_ptr<Expression> optimize() final;
     const char* getOpName() const final;
+
+protected:
+    struct Arguments {
+        Arguments(Value targetOfSearch, int startIndex, int endIndex)
+            : targetOfSearch(targetOfSearch), startIndex(startIndex), endIndex(endIndex) {}
+
+        Value targetOfSearch;
+        int startIndex;
+        int endIndex;
+    };
+    /**
+     * When given 'operands' which correspond to the arguments to $indexOfArray, evaluates and
+     * validates the target value, starting index, and ending index arguments and returns their
+     * values as a Arguments struct. The starting index and ending index are optional, so as default
+     * 'startIndex' will be 0 and 'endIndex' will be the length of the input array. Throws a
+     * UserException if the values are found to be invalid in some way, e.g. if the indexes are not
+     * numbers.
+     */
+    Arguments evaluateAndValidateArguments(const Document& root,
+                                           const ExpressionVector& operands,
+                                           size_t arrayLength) const;
+
+private:
+    class Optimized;
 };
 
 
@@ -1978,6 +2005,14 @@ public:
      */
     static const double kLongLongMaxPlusOneAsDouble;
 
+    /**
+     * Creates a $convert expression converting from 'input' to the type given by 'toType'. Leaves
+     * 'onNull' and 'onError' unspecified.
+     */
+    static boost::intrusive_ptr<Expression> create(const boost::intrusive_ptr<ExpressionContext>&,
+                                                   const boost::intrusive_ptr<Expression>& input,
+                                                   BSONType toType);
+
     static boost::intrusive_ptr<Expression> parse(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         BSONElement expr,
@@ -1993,6 +2028,10 @@ protected:
     void _doAddDependencies(DepsTracker* deps) const final;
 
 private:
+    ExpressionConvert(const boost::intrusive_ptr<ExpressionContext>&,
+                      const boost::intrusive_ptr<Expression>& input,
+                      BSONType toType);
+
     BSONType computeTargetType(Value typeName) const;
     Value performConversion(BSONType targetType, Value inputValue) const;
 

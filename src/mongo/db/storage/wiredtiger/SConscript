@@ -36,10 +36,12 @@ if wiredtiger:
     wtEnv.Library(
         target='storage_wiredtiger_core',
         source= [
+            'wiredtiger_begin_transaction_block.cpp',
             'wiredtiger_global_options.cpp',
             'wiredtiger_index.cpp',
             'wiredtiger_kv_engine.cpp',
             'wiredtiger_oplog_manager.cpp',
+            'wiredtiger_prepare_conflict.cpp',
             'wiredtiger_record_store.cpp',
             'wiredtiger_recovery_unit.cpp',
             'wiredtiger_session_cache.cpp',
@@ -50,13 +52,16 @@ if wiredtiger:
         LIBDEPS= [
             '$BUILD_DIR/mongo/base',
             '$BUILD_DIR/mongo/db/bson/dotted_path_support',
+            '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
             '$BUILD_DIR/mongo/db/catalog/collection',
             '$BUILD_DIR/mongo/db/catalog/collection_options',
             '$BUILD_DIR/mongo/db/concurrency/lock_manager',
             '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+            '$BUILD_DIR/mongo/db/curop',
             '$BUILD_DIR/mongo/db/index/index_descriptor',
             '$BUILD_DIR/mongo/db/global_settings',
             '$BUILD_DIR/mongo/db/namespace_string',
+            '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
             '$BUILD_DIR/mongo/db/repl/repl_settings',
             '$BUILD_DIR/mongo/db/server_options_core',
             '$BUILD_DIR/mongo/db/service_context',
@@ -75,8 +80,7 @@ if wiredtiger:
             'storage_wiredtiger_customization_hooks',
             ],
         LIBDEPS_PRIVATE= [
-            # SERVER-31802 : remove this.
-            '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+            '$BUILD_DIR/mongo/util/options_parser/options_parser',
             ],
         )
 
@@ -96,10 +100,12 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/storage/kv/kv_engine',
             '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
             '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
-            '$BUILD_DIR/mongo/db/commands/server_status',
         ],
         LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/db/commands/server_status',
             '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+            '$BUILD_DIR/mongo/db/storage/storage_engine_common',
+            '$BUILD_DIR/mongo/util/options_parser/options_parser',
         ],
     )
 
@@ -117,6 +123,7 @@ if wiredtiger:
         source=['wiredtiger_init_test.cpp',
                 ],
         LIBDEPS=[
+            '$BUILD_DIR/mongo/db/auth/authmocks',
             '$BUILD_DIR/mongo/db/serveronly',
             '$BUILD_DIR/mongo/db/service_context',
             '$BUILD_DIR/mongo/db/service_context_d',
@@ -125,6 +132,22 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_core',
             ],
         )
+
+    wtEnv.CppUnitTest(
+        target='storage_wiredtiger_recovery_unit_test',
+        source=[
+            'wiredtiger_recovery_unit_test.cpp',
+        ],
+        LIBDEPS=[
+            'storage_wiredtiger_mock',
+            '$BUILD_DIR/mongo/db/storage/recovery_unit_test_harness',
+            '$BUILD_DIR/mongo/util/clock_source_mock',
+        ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+            '$BUILD_DIR/mongo/db/repl/replmocks',
+        ],
+    )
 
     wtEnv.Library(
         target='additional_wiredtiger_record_store_tests',
@@ -153,7 +176,7 @@ if wiredtiger:
     )
 
     # All of these tests fail to compile under undefined behavior
-    # sanitizer due to unexpressed circular dependency edges. In particualr
+    # sanitizer due to unexpressed circular dependency edges. In particular
     # they all need a definition from the 'catalog'.
     if not using_ubsan:
         wtEnv.CppUnitTest(
@@ -164,6 +187,10 @@ if wiredtiger:
             LIBDEPS=[
                 'additional_wiredtiger_record_store_tests',
             ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+                '$BUILD_DIR/mongo/db/repl/replmocks',
+            ],
         )
 
         wtEnv.CppUnitTest(
@@ -173,6 +200,10 @@ if wiredtiger:
             ],
             LIBDEPS=[
                 'additional_wiredtiger_record_store_tests',
+            ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+                '$BUILD_DIR/mongo/db/repl/replmocks',
             ],
         )
 
@@ -198,14 +229,19 @@ if wiredtiger:
 
         wtEnv.CppUnitTest(
             target='storage_wiredtiger_kv_engine_test',
-            source=['wiredtiger_kv_engine_test.cpp',
-                    ],
+            source=[
+                'wiredtiger_kv_engine_test.cpp',
+            ],
             LIBDEPS=[
-                'storage_wiredtiger_mock',
+                '$BUILD_DIR/mongo/db/auth/authmocks',
                 '$BUILD_DIR/mongo/db/storage/kv/kv_engine_test_harness',
-                '$BUILD_DIR/mongo/s/client/sharding_client',
-                ],
-            )
+                'storage_wiredtiger_mock',
+            ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+                '$BUILD_DIR/mongo/db/repl/replmocks',
+            ],
+        )
 
         wtEnv.CppUnitTest(
             target='storage_wiredtiger_util_test',

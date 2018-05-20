@@ -32,12 +32,14 @@
  */
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/config.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_impl.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
@@ -51,7 +53,6 @@
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/map_util.h"
-#include "mongo/util/net/message_port.h"
 
 #define ASSERT_NULL(EXPR) ASSERT_FALSE(EXPR)
 #define ASSERT_NON_NULL(EXPR) ASSERT_TRUE(EXPR)
@@ -59,111 +60,18 @@
 namespace mongo {
 namespace {
 
+// Construct a simple, structured X509 name equivalent to "CN=mongodb.com"
+SSLX509Name buildX509Name() {
+    return SSLX509Name(std::vector<std::vector<SSLX509Name::Entry>>(
+        {{{kOID_CommonName.toString(), 19 /* Printable String */, "mongodb.com"}}}));
+}
+
 void setX509PeerInfo(const transport::SessionHandle& session, SSLPeerInfo info) {
     auto& sslPeerInfo = SSLPeerInfo::forSession(session);
     sslPeerInfo = info;
 }
 
 using std::vector;
-
-TEST(RoleParsingTest, BuildRoleBSON) {
-    RoleGraph graph;
-    RoleName roleA("roleA", "dbA");
-    RoleName roleB("roleB", "dbB");
-    RoleName roleC("roleC", "dbC");
-    ActionSet actions;
-    actions.addAction(ActionType::find);
-    actions.addAction(ActionType::insert);
-
-    ASSERT_OK(graph.createRole(roleA));
-    ASSERT_OK(graph.createRole(roleB));
-    ASSERT_OK(graph.createRole(roleC));
-
-    ASSERT_OK(graph.addRoleToRole(roleA, roleC));
-    ASSERT_OK(graph.addRoleToRole(roleA, roleB));
-    ASSERT_OK(graph.addRoleToRole(roleB, roleC));
-
-    ASSERT_OK(graph.addPrivilegeToRole(
-        roleA, Privilege(ResourcePattern::forAnyNormalResource(), actions)));
-    ASSERT_OK(graph.addPrivilegeToRole(
-        roleB, Privilege(ResourcePattern::forExactNamespace(NamespaceString("dbB.foo")), actions)));
-    ASSERT_OK(
-        graph.addPrivilegeToRole(roleC, Privilege(ResourcePattern::forClusterResource(), actions)));
-    ASSERT_OK(graph.recomputePrivilegeData());
-
-
-    // Role A
-    mutablebson::Document doc;
-    ASSERT_OK(AuthorizationManager::getBSONForRole(&graph, roleA, doc.root()));
-    BSONObj roleDoc = doc.getObject();
-
-    ASSERT_EQUALS("dbA.roleA", roleDoc["_id"].String());
-    ASSERT_EQUALS("roleA", roleDoc["role"].String());
-    ASSERT_EQUALS("dbA", roleDoc["db"].String());
-
-    vector<BSONElement> privs = roleDoc["privileges"].Array();
-    ASSERT_EQUALS(1U, privs.size());
-    ASSERT_EQUALS("", privs[0].Obj()["resource"].Obj()["db"].String());
-    ASSERT_EQUALS("", privs[0].Obj()["resource"].Obj()["collection"].String());
-    ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].eoo());
-    vector<BSONElement> actionElements = privs[0].Obj()["actions"].Array();
-    ASSERT_EQUALS(2U, actionElements.size());
-    ASSERT_EQUALS("find", actionElements[0].String());
-    ASSERT_EQUALS("insert", actionElements[1].String());
-
-    vector<BSONElement> roles = roleDoc["roles"].Array();
-    ASSERT_EQUALS(2U, roles.size());
-    ASSERT_EQUALS("roleC", roles[0].Obj()["role"].String());
-    ASSERT_EQUALS("dbC", roles[0].Obj()["db"].String());
-    ASSERT_EQUALS("roleB", roles[1].Obj()["role"].String());
-    ASSERT_EQUALS("dbB", roles[1].Obj()["db"].String());
-
-    // Role B
-    doc.reset();
-    ASSERT_OK(AuthorizationManager::getBSONForRole(&graph, roleB, doc.root()));
-    roleDoc = doc.getObject();
-
-    ASSERT_EQUALS("dbB.roleB", roleDoc["_id"].String());
-    ASSERT_EQUALS("roleB", roleDoc["role"].String());
-    ASSERT_EQUALS("dbB", roleDoc["db"].String());
-
-    privs = roleDoc["privileges"].Array();
-    ASSERT_EQUALS(1U, privs.size());
-    ASSERT_EQUALS("dbB", privs[0].Obj()["resource"].Obj()["db"].String());
-    ASSERT_EQUALS("foo", privs[0].Obj()["resource"].Obj()["collection"].String());
-    ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].eoo());
-    actionElements = privs[0].Obj()["actions"].Array();
-    ASSERT_EQUALS(2U, actionElements.size());
-    ASSERT_EQUALS("find", actionElements[0].String());
-    ASSERT_EQUALS("insert", actionElements[1].String());
-
-    roles = roleDoc["roles"].Array();
-    ASSERT_EQUALS(1U, roles.size());
-    ASSERT_EQUALS("roleC", roles[0].Obj()["role"].String());
-    ASSERT_EQUALS("dbC", roles[0].Obj()["db"].String());
-
-    // Role C
-    doc.reset();
-    ASSERT_OK(AuthorizationManager::getBSONForRole(&graph, roleC, doc.root()));
-    roleDoc = doc.getObject();
-
-    ASSERT_EQUALS("dbC.roleC", roleDoc["_id"].String());
-    ASSERT_EQUALS("roleC", roleDoc["role"].String());
-    ASSERT_EQUALS("dbC", roleDoc["db"].String());
-
-    privs = roleDoc["privileges"].Array();
-    ASSERT_EQUALS(1U, privs.size());
-    ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].Bool());
-    ASSERT(privs[0].Obj()["resource"].Obj()["db"].eoo());
-    ASSERT(privs[0].Obj()["resource"].Obj()["collection"].eoo());
-    actionElements = privs[0].Obj()["actions"].Array();
-    ASSERT_EQUALS(2U, actionElements.size());
-    ASSERT_EQUALS("find", actionElements[0].String());
-    ASSERT_EQUALS("insert", actionElements[1].String());
-
-    roles = roleDoc["roles"].Array();
-    ASSERT_EQUALS(0U, roles.size());
-}
 
 class AuthorizationManagerTest : public ::mongo::unittest::Test {
 public:
@@ -173,9 +81,11 @@ public:
     }
 
     void setUp() override {
-        auto localExternalState = stdx::make_unique<AuthzManagerExternalStateMock>();
+        auto localExternalState = std::make_unique<AuthzManagerExternalStateMock>();
         externalState = localExternalState.get();
-        authzManager = stdx::make_unique<AuthorizationManager>(std::move(localExternalState));
+        authzManager = std::make_unique<AuthorizationManagerImpl>(
+            std::move(localExternalState),
+            AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
         externalState->setAuthorizationManager(authzManager.get());
         authzManager->setAuthEnabled(true);
 
@@ -255,13 +165,14 @@ TEST_F(AuthorizationManagerTest, testAcquireV2User) {
     authzManager->releaseUser(v2cluster);
 }
 
+#ifdef MONGO_CONFIG_SSL
 TEST_F(AuthorizationManagerTest, testLocalX509Authorization) {
     ServiceContextNoop serviceContext;
     transport::TransportLayerMock transportLayer{};
     transport::SessionHandle session = transportLayer.createSession();
     setX509PeerInfo(
         session,
-        SSLPeerInfo("CN=mongodb.com", {RoleName("read", "test"), RoleName("readWrite", "test")}));
+        SSLPeerInfo(buildX509Name(), {RoleName("read", "test"), RoleName("readWrite", "test")}));
     ServiceContext::UniqueClient client = serviceContext.makeClient("testClient", session);
     ServiceContext::UniqueOperationContext opCtx = client->makeOperationContext();
 
@@ -288,6 +199,7 @@ TEST_F(AuthorizationManagerTest, testLocalX509Authorization) {
 
     authzManager->releaseUser(x509User);
 }
+#endif
 
 TEST_F(AuthorizationManagerTest, testLocalX509AuthorizationInvalidUser) {
     ServiceContextNoop serviceContext;
@@ -295,7 +207,7 @@ TEST_F(AuthorizationManagerTest, testLocalX509AuthorizationInvalidUser) {
     transport::SessionHandle session = transportLayer.createSession();
     setX509PeerInfo(
         session,
-        SSLPeerInfo("CN=mongodb.com", {RoleName("read", "test"), RoleName("write", "test")}));
+        SSLPeerInfo(buildX509Name(), {RoleName("read", "test"), RoleName("write", "test")}));
     ServiceContext::UniqueClient client = serviceContext.makeClient("testClient", session);
     ServiceContext::UniqueOperationContext opCtx = client->makeOperationContext();
 
@@ -370,7 +282,9 @@ public:
             stdx::make_unique<AuthzManagerExternalStateMockWithExplicitUserPrivileges>();
         externalState = localExternalState.get();
         externalState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
-        authzManager = stdx::make_unique<AuthorizationManager>(std::move(localExternalState));
+        authzManager = stdx::make_unique<AuthorizationManagerImpl>(
+            std::move(localExternalState),
+            AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
         externalState->setAuthorizationManager(authzManager.get());
         authzManager->setAuthEnabled(true);
     }
@@ -451,7 +365,7 @@ public:
     };
 
     virtual void setUp() override {
-        opCtx.setRecoveryUnit(recoveryUnit, OperationContext::kNotInUnitOfWork);
+        opCtx.setRecoveryUnit(recoveryUnit, WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
         AuthorizationManagerTest::setUp();
     }
 

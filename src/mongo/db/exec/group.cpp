@@ -34,11 +34,15 @@
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
+
+// Forces a hang in the javascript execution while initializing the group stage.
+MONGO_FP_DECLARE(hangInGroupReduceJs);
 
 using std::unique_ptr;
 using std::vector;
@@ -109,8 +113,17 @@ Status GroupStage::initGroupScripting() {
     } catch (const AssertionException& e) {
         return e.toStatus("Failed to initialize group reduce function: ");
     }
-    invariant(_scope->exec(
-        "$arr = [];", "group reduce init 2", false, true, false /*assertOnError*/, 2 * 1000));
+
+    try {
+        _scope->exec("$arr = [];",
+                     "group reduce init 2",
+                     false,  // printResult
+                     true,   // reportError
+                     true,   // assertOnError
+                     2 * 1000);
+    } catch (const AssertionException& e) {
+        return e.toStatus("Failed to initialize group reduce function: ");
+    }
 
     // Initialize _reduceFunction.
     _reduceFunction = _scope->createFunction(
@@ -155,6 +168,15 @@ Status GroupStage::processObject(const BSONObj& obj) {
     _scope->setObject("obj", objCopy, true);
     _scope->setNumber("n", n - 1);
 
+    boost::optional<std::string> oldMsg;
+    if (MONGO_FAIL_POINT(hangInGroupReduceJs)) {
+        oldMsg = CurOpFailpointHelpers::updateCurOpMsg(getOpCtx(), "hangInGroupReduceJs");
+    }
+    auto resetMsgGuard = MakeGuard([&] {
+        if (oldMsg) {
+            CurOpFailpointHelpers::updateCurOpMsg(getOpCtx(), *oldMsg);
+        }
+    });
     try {
         _scope->invoke(_reduceFunction, 0, 0, 0, true /*assertOnError*/);
     } catch (const AssertionException& e) {
@@ -195,8 +217,17 @@ StatusWith<BSONObj> GroupStage::finalizeResults() {
 
     BSONObj results = _scope->getObject("$arr").getOwned();
 
-    invariant(_scope->exec(
-        "$arr = [];", "group clean up", false, true, false /*assertOnError*/, 2 * 1000));
+    try {
+        _scope->exec("$arr = [];",
+                     "group clean up",
+                     false,  // printResult
+                     true,   // reportError
+                     true,   // assertOnError
+                     2 * 1000);
+    } catch (const AssertionException& e) {
+        return e.toStatus("Failed to clean up group: ");
+    }
+
     _scope->gc();
 
     return results;
@@ -228,17 +259,11 @@ PlanStage::StageState GroupStage::doWork(WorkingSetID* out) {
     } else if (PlanStage::NEED_YIELD == state) {
         *out = id;
         return state;
-    } else if (PlanStage::FAILURE == state) {
+    } else if (PlanStage::FAILURE == state || PlanStage::DEAD == state) {
+        // The stage which produces a failure is responsible for allocating a working set member
+        // with error details.
+        invariant(WorkingSet::INVALID_ID != id);
         *out = id;
-        // If a stage fails, it may create a status WSM to indicate why it failed, in which
-        // case 'id' is valid.  If ID is invalid, we create our own error message.
-        if (WorkingSet::INVALID_ID == id) {
-            const std::string errmsg = "group stage failed to read in results from child";
-            *out = WorkingSetCommon::allocateStatusMember(
-                _ws, Status(ErrorCodes::InternalError, errmsg));
-        }
-        return state;
-    } else if (PlanStage::DEAD == state) {
         return state;
     } else if (PlanStage::ADVANCED == state) {
         WorkingSetMember* member = _ws->get(id);

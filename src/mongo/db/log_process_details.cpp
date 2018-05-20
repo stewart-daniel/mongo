@@ -36,12 +36,10 @@
 
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
-#include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/version.h"
 

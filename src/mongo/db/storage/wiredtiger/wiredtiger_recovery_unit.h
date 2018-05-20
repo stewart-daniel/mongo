@@ -39,7 +39,9 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/util/timer.h"
 
@@ -62,22 +64,22 @@ public:
     ~WiredTigerRecoveryUnit();
 
     void beginUnitOfWork(OperationContext* opCtx) override;
+    void prepareUnitOfWork() override;
     void commitUnitOfWork() override;
     void abortUnitOfWork() override;
 
     bool waitUntilDurable() override;
+
+    bool waitUntilUnjournaledWritesDurable() override;
 
     void registerChange(Change* change) override;
 
     void abandonSnapshot() override;
     void preallocateSnapshot() override;
 
-    Status setReadFromMajorityCommittedSnapshot() override;
-    bool isReadingFromMajorityCommittedSnapshot() const override {
-        return _readFromMajorityCommittedSnapshot;
-    }
+    Status obtainMajorityCommittedSnapshot() override;
 
-    boost::optional<Timestamp> getMajorityCommittedSnapshot() const override;
+    boost::optional<Timestamp> getPointInTimeReadTimestamp() const override;
 
     SnapshotId getSnapshotId() const override;
 
@@ -89,16 +91,29 @@ public:
 
     Timestamp getCommitTimestamp() override;
 
-    Status selectSnapshot(Timestamp timestamp) override;
+    void setPrepareTimestamp(Timestamp timestamp) override;
+
+    void setIgnorePrepared(bool ignore) override;
+
+    void setTimestampReadSource(ReadSource source,
+                                boost::optional<Timestamp> provided = boost::none) override;
+
+    ReadSource getTimestampReadSource() const override;
 
     void* writingPtr(void* data, size_t len) override;
 
     void setRollbackWritesDisabled() override {}
 
+    virtual void setOrderedCommit(bool orderedCommit) override {
+        _orderedCommit = orderedCommit;
+    }
+
     // ---- WT STUFF
 
     WiredTigerSession* getSession();
-    void setIsOplogReader();
+    void setIsOplogReader() {
+        _isOplogReader = true;
+    }
 
     /**
      * Enter a period of wait or computation during which there are no WT calls.
@@ -127,14 +142,6 @@ public:
 
     static void appendGlobalStats(BSONObjBuilder& b);
 
-    /**
-     * Prepares this RU to be the basis for a named snapshot.
-     *
-     * Begins a WT transaction, and invariants if we are already in one.
-     * Bans being in a WriteUnitOfWork until the next call to abandonSnapshot().
-     */
-    void prepareForCreateSnapshot(OperationContext* opCtx);
-
 private:
     void _abort();
     void _commit();
@@ -143,8 +150,6 @@ private:
     void _txnClose(bool commit);
     void _txnOpen();
 
-    char* _getOplogReaderConfigString();
-
     WiredTigerSessionCache* _sessionCache;  // not owned
     WiredTigerOplogManager* _oplogManager;  // not owned
     UniqueWiredTigerSession _session;
@@ -152,9 +157,22 @@ private:
     bool _inUnitOfWork;
     bool _active;
     bool _isTimestamped = false;
+
+    // Specifies which external source to use when setting read timestamps on transactions.
+    ReadSource _timestampReadSource = ReadSource::kNone;
+
+    // Commits are assumed ordered.  Unordered commits are assumed to always need to reserve a
+    // new optime, and thus always call oplogDiskLocRegister() on the record store.
+    bool _orderedCommit = true;
+
+    // Ignoring prepared transactions will not return prepare conflicts and allow seeing prepared,
+    // but uncommitted data.
+    WiredTigerBeginTxnBlock::IgnorePrepared _ignorePrepared{
+        WiredTigerBeginTxnBlock::IgnorePrepared::kNoIgnore};
     Timestamp _commitTimestamp;
+    Timestamp _prepareTimestamp;
+    boost::optional<Timestamp> _lastTimestampSet;
     uint64_t _mySnapshotId;
-    bool _readFromMajorityCommittedSnapshot = false;
     Timestamp _majorityCommittedSnapshot;
     Timestamp _readAtTimestamp;
     std::unique_ptr<Timer> _timer;

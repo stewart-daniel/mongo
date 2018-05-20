@@ -41,7 +41,6 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/view_response_formatter.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/util/log.h"
 
@@ -68,10 +67,6 @@ public:
     }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext* serviceContext) const override {
-        if (repl::ReplicationCoordinator::get(serviceContext)->getSettings().isSlave()) {
-            // ok on --slave setups
-            return Command::AllowedOnSecondary::kAlways;
-        }
         return Command::AllowedOnSecondary::kOptIn;
     }
 
@@ -110,10 +105,11 @@ public:
     }
 
     Status explain(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
+                   const OpMsgRequest& opMsgRequest,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
+        std::string dbname = opMsgRequest.getDatabase().toString();
+        const BSONObj& cmdObj = opMsgRequest.body;
         // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
         // of a view, the locks need to be released.
         boost::optional<AutoGetCollectionForReadCommand> ctx;
@@ -154,13 +150,10 @@ public:
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata();
+        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
 
-        auto statusWithPlanExecutor = getExecutorCount(opCtx,
-                                                       collection,
-                                                       request.getValue(),
-                                                       true,  // explain
-                                                       PlanExecutor::YIELD_AUTO);
+        auto statusWithPlanExecutor =
+            getExecutorCount(opCtx, collection, request.getValue(), true /*explain*/);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
@@ -185,18 +178,19 @@ public:
 
         const bool isExplain = false;
         auto request = CountRequest::parseFromBSON(nss, cmdObj, isExplain);
-        if (!request.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, request.getStatus());
-        }
+        uassertStatusOK(request.getStatus());
+
+        // Check whether we are allowed to read from this node after acquiring our locks.
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        uassertStatusOK(replCoord->checkCanServeReadsFor(
+            opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
 
         if (ctx->getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
             ctx.reset();
 
             auto viewAggregation = request.getValue().asAggregationCommand();
-            if (!viewAggregation.isOK()) {
-                return CommandHelpers::appendCommandStatus(result, viewAggregation.getStatus());
-            }
+            uassertStatusOK(viewAggregation.getStatus());
 
             BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregation.getValue())));
@@ -209,16 +203,11 @@ public:
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata();
+        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
 
-        auto statusWithPlanExecutor = getExecutorCount(opCtx,
-                                                       collection,
-                                                       request.getValue(),
-                                                       false,  // !explain
-                                                       PlanExecutor::YIELD_AUTO);
-        if (!statusWithPlanExecutor.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, statusWithPlanExecutor.getStatus());
-        }
+        auto statusWithPlanExecutor =
+            getExecutorCount(opCtx, collection, request.getValue(), false /*explain*/);
+        uassertStatusOK(statusWithPlanExecutor.getStatus());
 
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -230,9 +219,7 @@ public:
         }
 
         Status execPlanStatus = exec->executePlan();
-        if (!execPlanStatus.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, execPlanStatus);
-        }
+        uassertStatusOK(execPlanStatus);
 
         PlanSummaryStats summaryStats;
         Explain::getSummaryStats(*exec, &summaryStats);

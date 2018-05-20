@@ -39,18 +39,18 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/oplog_interface_remote.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/rollback_source_impl.h"
 #include "mongo/db/repl/rs_rollback.h"
-#include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/server_parameters.h"
@@ -77,6 +77,22 @@ const auto defaultBatchSize = (16 * 1024 * 1024) / 12 * 10;
 
 // The batchSize to use for the find/getMore queries called by the OplogFetcher
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(bgSyncOplogFetcherBatchSize, int, defaultBatchSize);
+
+// The batchSize to use for the find/getMore queries called by the rollback common point resolver.
+// A batchSize of 0 means that the 'find' and 'getMore' commands will be given no batchSize.
+// We set the default to 2000 to prevent the sync source from having to read too much data at once,
+// and reduce the chance of a socket timeout.
+// We choose 2000 for (10 minute timeout) * (60 sec / min) * (50 MB / second) / (16 MB / document).
+constexpr int defaultRollbackBatchSize = 2000;
+MONGO_EXPORT_SERVER_PARAMETER(rollbackRemoteOplogQueryBatchSize, int, defaultRollbackBatchSize)
+    ->withValidator([](const auto& potentialNewValue) {
+        if (potentialNewValue < 0) {
+            return Status(ErrorCodes::BadValue,
+                          "rollbackRemoteOplogQueryBatchSize cannot be negative.");
+        }
+
+        return Status::OK();
+    });
 
 // If 'forceRollbackViaRefetch' is true, always perform rollbacks via the refetch algorithm, even if
 // the storage engine supports rollback via recover to timestamp.
@@ -146,8 +162,8 @@ BackgroundSync::BackgroundSync(
     ReplicationCoordinator* replicationCoordinator,
     ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
     ReplicationProcess* replicationProcess,
-    std::unique_ptr<OplogBuffer> oplogBuffer)
-    : _oplogBuffer(std::move(oplogBuffer)),
+    OplogBuffer* oplogBuffer)
+    : _oplogBuffer(oplogBuffer),
       _replCoord(replicationCoordinator),
       _replicationCoordinatorExternalState(replicationCoordinatorExternalState),
       _replicationProcess(replicationProcess) {
@@ -157,8 +173,6 @@ BackgroundSync::BackgroundSync(
 }
 
 void BackgroundSync::startup(OperationContext* opCtx) {
-    _oplogBuffer->startup(opCtx);
-
     invariant(!_producerThread);
     _producerThread.reset(new stdx::thread([this] { _run(); }));
 }
@@ -166,10 +180,6 @@ void BackgroundSync::startup(OperationContext* opCtx) {
 void BackgroundSync::shutdown(OperationContext* opCtx) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
-    // Clear the buffer. This unblocks the OplogFetcher if it is blocked with a full queue, but
-    // ensures that it won't add anything. It will also unblock the OpApplier pipeline if it is
-    // waiting for an operation to be past the slaveDelay point.
-    clearBuffer(opCtx);
     _state = ProducerState::Stopped;
 
     if (_syncSourceResolver) {
@@ -189,7 +199,6 @@ void BackgroundSync::shutdown(OperationContext* opCtx) {
 
 void BackgroundSync::join(OperationContext* opCtx) {
     _producerThread->join();
-    _oplogBuffer->shutdown(opCtx);
 }
 
 bool BackgroundSync::inShutdown() const {
@@ -219,7 +228,8 @@ void BackgroundSync::_run() {
             fassertFailed(28546);
         }
     }
-    stop(true);
+    // No need to reset optimes here because we are shutting down.
+    stop(false);
 }
 
 void BackgroundSync::_runProducer() {
@@ -318,7 +328,7 @@ void BackgroundSync::_produce() {
     if (ErrorCodes::CallbackCanceled == status || ErrorCodes::isShutdownError(status.code())) {
         return;
     }
-    fassertStatusOK(40349, status);
+    fassert(40349, status);
     _syncSourceResolver->join();
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -464,7 +474,7 @@ void BackgroundSync::_produce() {
         fassertFailedWithStatus(34440, exceptionToStatus());
     }
 
-    const auto logLevel = Command::testCommandsEnabled ? 0 : 1;
+    const auto logLevel = getTestCommandsEnabled() ? 0 : 1;
     LOG(logLevel) << "scheduling fetcher to read remote oplog on " << _syncSourceHost
                   << " starting at " << oplogFetcher->getFindQuery_forTest()["filter"];
     auto scheduleStatus = oplogFetcher->startup();
@@ -565,28 +575,9 @@ Status BackgroundSync::_enqueueDocuments(Fetcher::Documents::const_iterator begi
     return Status::OK();
 }
 
-bool BackgroundSync::peek(OperationContext* opCtx, BSONObj* op) {
-    return _oplogBuffer->peek(opCtx, op);
-}
-
-void BackgroundSync::waitForMore() {
-    // Block for one second before timing out.
-    _oplogBuffer->waitForData(Seconds(1));
-}
-
-void BackgroundSync::consume(OperationContext* opCtx) {
-    // this is just to get the op off the queue, it's been peeked at
-    // and queued for application already
-    BSONObj op;
-    if (_oplogBuffer->tryPop(opCtx, &op)) {
-        bufferCountGauge.decrement(1);
-        bufferSizeGauge.decrement(getSize(op));
-    } else {
-        invariant(inShutdown());
-        // This means that shutdown() was called between the consumer's calls to peek() and
-        // consume(). shutdown() cleared the buffer so there is nothing for us to consume here.
-        // Since our postcondition is already met, it is safe to return successfully.
-    }
+void BackgroundSync::onOperationConsumed(const BSONObj& op) {
+    bufferCountGauge.decrement(1);
+    bufferSizeGauge.decrement(getSize(op));
 }
 
 void BackgroundSync::_runRollback(OperationContext* opCtx,
@@ -599,6 +590,8 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
         _replCoord->abortCatchupIfNeeded().transitional_ignore();
         return;
     }
+
+    ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
 
     // Rollback is a synchronous operation that uses the task executor and may not be
     // executed inside the fetcher callback.
@@ -650,8 +643,13 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
         return connection->get();
     };
 
-    auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    // Because oplog visibility is updated asynchronously, wait until all uncommitted oplog entries
+    // are visible before potentially truncating the oplog.
+    storageInterface->waitForAllEarlierOplogWritesToBeVisible(opCtx);
+
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     if (!forceRollbackViaRefetch.load() && storageEngine->supportsRecoverToStableTimestamp()) {
+        log() << "Rollback using 'recoverToStableTimestamp' method.";
         _runRollbackViaRecoverToCheckpoint(
             opCtx, source, &localOplog, storageInterface, getConnection);
     } else {
@@ -671,7 +669,10 @@ void BackgroundSync::_runRollbackViaRecoverToCheckpoint(
     StorageInterface* storageInterface,
     OplogInterfaceRemote::GetConnectionFn getConnection) {
 
-    OplogInterfaceRemote remoteOplog(getConnection, NamespaceString::kRsOplogNamespace.ns());
+    OplogInterfaceRemote remoteOplog(source,
+                                     getConnection,
+                                     NamespaceString::kRsOplogNamespace.ns(),
+                                     rollbackRemoteOplogQueryBatchSize.load());
 
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -702,8 +703,10 @@ void BackgroundSync::_fallBackOnRollbackViaRefetch(
     OplogInterface* localOplog,
     OplogInterfaceRemote::GetConnectionFn getConnection) {
 
-    RollbackSourceImpl rollbackSource(
-        getConnection, source, NamespaceString::kRsOplogNamespace.ns());
+    RollbackSourceImpl rollbackSource(getConnection,
+                                      source,
+                                      NamespaceString::kRsOplogNamespace.ns(),
+                                      rollbackRemoteOplogQueryBatchSize.load());
 
     rollback(opCtx, *localOplog, rollbackSource, requiredRBID, _replCoord, _replicationProcess);
 }
@@ -722,11 +725,14 @@ void BackgroundSync::stop(bool resetLastFetchedOptime) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
     _state = ProducerState::Stopped;
+    log() << "Stopping replication producer";
+
     _syncSourceHost = HostAndPort();
     if (resetLastFetchedOptime) {
         invariant(_oplogBuffer->isEmpty());
         _lastOpTimeFetched = OpTime();
         _lastFetchedHash = 0;
+        log() << "Resetting last fetched optimes in bgsync";
     }
 
     if (_syncSourceResolver) {
@@ -740,6 +746,7 @@ void BackgroundSync::stop(bool resetLastFetchedOptime) {
 
 void BackgroundSync::start(OperationContext* opCtx) {
     OpTimeWithHash lastAppliedOpTimeWithHash;
+    ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
     do {
         lastAppliedOpTimeWithHash = _readLastAppliedOpTimeWithHash(opCtx);
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -757,6 +764,9 @@ void BackgroundSync::start(OperationContext* opCtx) {
         // When a node steps down during drain mode, the last fetched optime would be newer than
         // the last applied.
         if (_lastOpTimeFetched <= lastAppliedOpTimeWithHash.opTime) {
+            LOG(1) << "Setting bgsync _lastOpTimeFetched=" << lastAppliedOpTimeWithHash.opTime
+                   << " and _lastFetchedHash=" << lastAppliedOpTimeWithHash.value
+                   << ". Previous _lastOpTimeFetched: " << _lastOpTimeFetched;
             _lastOpTimeFetched = lastAppliedOpTimeWithHash.opTime;
             _lastFetchedHash = lastAppliedOpTimeWithHash.value;
         }
@@ -766,8 +776,7 @@ void BackgroundSync::start(OperationContext* opCtx) {
     LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched << " " << _lastFetchedHash;
 }
 
-void BackgroundSync::clearBuffer(OperationContext* opCtx) {
-    _oplogBuffer->clear(opCtx);
+void BackgroundSync::onBufferCleared() {
     const auto count = bufferCountGauge.get();
     bufferCountGauge.decrement(count);
     const auto size = bufferSizeGauge.get();
@@ -802,8 +811,11 @@ OpTimeWithHash BackgroundSync::_readLastAppliedOpTimeWithHash(OperationContext* 
                  << "\" field. Oplog entry: " << redact(oplogEntry) << ": " << redact(status);
         fassertFailed(18902);
     }
+
     OplogEntry parsedEntry(oplogEntry);
-    return OpTimeWithHash(hash, parsedEntry.getOpTime());
+    auto lastOptime = OpTimeWithHash(hash, parsedEntry.getOpTime());
+    LOG(1) << "Successfully read last entry of oplog while starting bgsync: " << redact(oplogEntry);
+    return lastOptime;
 }
 
 bool BackgroundSync::shouldStopFetching() const {
@@ -821,12 +833,6 @@ bool BackgroundSync::shouldStopFetching() const {
     }
 
     return false;
-}
-
-void BackgroundSync::pushTestOpToBuffer(OperationContext* opCtx, const BSONObj& op) {
-    _oplogBuffer->push(opCtx, op);
-    bufferCountGauge.increment();
-    bufferSizeGauge.increment(op.objsize());
 }
 
 BackgroundSync::ProducerState BackgroundSync::getState() const {

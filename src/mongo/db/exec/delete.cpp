@@ -40,7 +40,7 @@
 #include "mongo/db/exec/write_stage_common.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -130,15 +130,10 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
 
             case PlanStage::FAILURE:
             case PlanStage::DEAD:
+                // The stage which produces a failure is responsible for allocating a working set
+                // member with error details.
+                invariant(WorkingSet::INVALID_ID != id);
                 *out = id;
-
-                // If a stage fails, it may create a status WSM to indicate why it failed, in which
-                // case 'id' is valid.  If ID is invalid, we create our own error message.
-                if (WorkingSet::INVALID_ID == id) {
-                    const std::string errmsg = "delete stage failed to read in results from child";
-                    *out = WorkingSetCommon::allocateStatusMember(
-                        _ws, Status(ErrorCodes::InternalError, errmsg));
-                }
                 return status;
 
             case PlanStage::NEED_TIME:

@@ -40,19 +40,22 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/dbtests/framework.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
@@ -125,9 +128,10 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
 
 
 int dbtestsMain(int argc, char** argv, char** envp) {
-    Command::testCommandsEnabled = true;
+    ::mongo::setTestCommandsEnabled(true);
     ::mongo::setupSynchronousSignalHandlers();
     mongo::dbtests::initWireSpec();
+
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
     serverGlobalParams.featureCompatibility.setVersion(
         ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
@@ -152,9 +156,14 @@ int dbtestsMain(int argc, char** argv, char** envp) {
     preciseClock->advance(Seconds(1));
     service->setPreciseClockSource(std::move(preciseClock));
 
-    repl::setGlobalReplicationCoordinator(
-        new repl::ReplicationCoordinatorMock(service, replSettings));
-    repl::getGlobalReplicationCoordinator()
+    service->setTransportLayer(
+        transport::TransportLayerManager::makeAndStartDefaultEgressTransportLayer());
+
+    repl::ReplicationCoordinator::set(
+        service,
+        std::unique_ptr<repl::ReplicationCoordinator>(
+            new repl::ReplicationCoordinatorMock(service, replSettings)));
+    repl::ReplicationCoordinator::get(getGlobalServiceContext())
         ->setFollowerMode(repl::MemberState::RS_PRIMARY)
         .ignore();
 

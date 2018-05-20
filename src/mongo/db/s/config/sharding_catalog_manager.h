@@ -171,15 +171,20 @@ public:
     /**
      * Updates metadata in the config.chunks collection so the chunks with given boundaries are seen
      * merged into a single larger chunk.
+     * If 'validAfter' is not set, this means the commit request came from an older server version,
+     * which is not history-aware.
      */
     Status commitChunkMerge(OperationContext* opCtx,
                             const NamespaceString& nss,
                             const OID& requestEpoch,
                             const std::vector<BSONObj>& chunkBoundaries,
-                            const std::string& shardName);
+                            const std::string& shardName,
+                            const boost::optional<Timestamp>& validAfter);
 
     /**
      * Updates metadata in config.chunks collection to show the given chunk in its new shard.
+     * If 'validAfter' is not set, this means the commit request came from an older server version,
+     * which is not history-aware.
      */
     StatusWith<BSONObj> commitChunkMigration(OperationContext* opCtx,
                                              const NamespaceString& nss,
@@ -187,7 +192,8 @@ public:
                                              const boost::optional<ChunkType>& controlChunk,
                                              const OID& collectionEpoch,
                                              const ShardId& fromShard,
-                                             const ShardId& toShard);
+                                             const ShardId& toShard,
+                                             const boost::optional<Timestamp>& validAfter);
 
     //
     // Database Operations
@@ -218,6 +224,12 @@ public:
      */
     StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
                                                               const ShardId& shardId);
+
+    /**
+     * Updates metadata in config.databases collection to show the given primary database on its
+     * new shard.
+     */
+    Status commitMovePrimary(OperationContext* opCtx, const StringData nss, const ShardId& toShard);
 
     //
     // Collection Operations
@@ -263,24 +275,9 @@ public:
      * Iterates through each entry in config.collections that does not have a UUID, generates a UUID
      * for the collection, and updates the entry with the generated UUID.
      *
-     * Remove after 3.4 -> 3.6 upgrade.
+     * If this function is not necessary for SERVER-33247, it can be removed.
      */
     void generateUUIDsForExistingShardedCollections(OperationContext* opCtx);
-
-
-    /**
-     * Returns the set of collections for the specified database, which have been marked as sharded.
-     * Goes directly to the config server's metadata, without checking the local cache so it should
-     * not be used in frequently called code paths.
-     *
-     * Throws exception on errors.
-     *
-     * TODO SERVER-32366: Make this an anonymous helper function in
-     * sharding_catalog_manager_database_operations.cpp since it will no longer need to be
-     * called outside of the ShardingCatalogManager.
-     */
-    std::vector<NamespaceString> getAllShardedCollectionsForDb(OperationContext* opCtx,
-                                                               StringData dbName);
 
     /**
      * Creates a new unsharded collection with the given options.
@@ -356,6 +353,25 @@ public:
      */
     static void clearForTests(ServiceContext* serviceContext);
 
+    //
+    // Upgrade/downgrade
+    //
+
+    /**
+     * Upgrade the chunk metadata to include the history field.
+     */
+    Status upgradeChunksHistory(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                const OID& collectionEpoch,
+                                const Timestamp validAfter);
+
+    /**
+     * Remove the history field from the chunk metadata.
+     */
+    Status downgradeChunksHistory(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  const OID& collectionEpoch);
+
 private:
     /**
      * Performs the necessary checks for version compatibility and creates a new config.version
@@ -425,7 +441,7 @@ private:
      */
     StatusWith<Shard::CommandResponse> _runCommandForAddShard(OperationContext* opCtx,
                                                               RemoteCommandTargeter* targeter,
-                                                              const std::string& dbName,
+                                                              StringData dbName,
                                                               const BSONObj& cmdObj);
 
     /**
@@ -457,6 +473,20 @@ private:
                                     const ShardId& primaryShardId,
                                     const std::vector<BSONObj>& initPoints,
                                     const bool distributeInitialChunks);
+
+    /**
+     * Retrieve the full chunk description from the config.
+     */
+    StatusWith<ChunkType> _findChunkOnConfig(OperationContext* opCtx,
+                                             const NamespaceString& nss,
+                                             const BSONObj& key);
+
+    /**
+     * Retrieve the the latest collection version from the config.
+     */
+    StatusWith<ChunkVersion> _findCollectionVersion(OperationContext* opCtx,
+                                                    const NamespaceString& nss,
+                                                    const OID& collectionEpoch);
 
     // The owning service context
     ServiceContext* const _serviceContext;

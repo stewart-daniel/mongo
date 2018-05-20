@@ -37,7 +37,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/query/cluster_client_cursor_params.h"
+#include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/s/query/cluster_query_result.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -75,6 +75,13 @@ class AsyncResultsMerger {
     MONGO_DISALLOW_COPYING(AsyncResultsMerger);
 
 public:
+    // When mongos has to do a merge in order to return results to the client in the correct sort
+    // order, it requests a sortKey meta-projection using this field name.
+    static constexpr StringData kSortKeyField = "$sortKey"_sd;
+
+    // The expected sort key pattern when 'compareWholeSortKey' is true.
+    static const BSONObj kWholeSortKeySortPattern;
+
     /**
      * Takes ownership of the cursors from ClusterClientCursorParams by storing their cursorIds and
      * the hosts on which they exist in _remotes.
@@ -91,7 +98,7 @@ public:
      */
     AsyncResultsMerger(OperationContext* opCtx,
                        executor::TaskExecutor* executor,
-                       ClusterClientCursorParams* params);
+                       AsyncResultsMergerParams params);
 
     /**
      * In order to be destroyed, either the ARM must have been kill()'ed or all cursors must have
@@ -160,6 +167,12 @@ public:
     StatusWith<ClusterQueryResult> nextReady();
 
     /**
+     * Blocks until the next result is ready, all remote cursors are exhausted, or there is an
+     * error.
+     */
+    StatusWith<ClusterQueryResult> blockingNext();
+
+    /**
      * Schedules remote work as required in order to make further results available. If there is an
      * error in scheduling this work, returns a non-ok status. On success, returns an event handle.
      * The caller can pass this event handle to 'executor' in order to be blocked until further
@@ -179,10 +192,32 @@ public:
     StatusWith<executor::TaskExecutor::EventHandle> nextEvent();
 
     /**
+     * Schedules a getMore on any remote hosts which:
+     *  - Do not have an error status set already.
+     *  - Don't already have a request outstanding.
+     *  - We don't currently have any results buffered.
+     *  - Are not exhausted (have a non-zero cursor id).
+     * Returns an error if any of the remotes responded with an error, or if we encounter an error
+     * while scheduling the getMore requests..
+     *
+     * In most cases users should call nextEvent() instead of this method, but this can be necessary
+     * if the caller of nextEvent() calls detachFromOperationContext() before the event is signaled.
+     * In such cases, the ARM cannot schedule getMores itself, and will need to be manually prompted
+     * after calling reattachToOperationContext().
+     *
+     * It is illegal to call this method if the ARM is not attached to an OperationContext.
+     */
+    Status scheduleGetMores();
+
+    /**
      * Adds the specified shard cursors to the set of cursors to be merged.  The results from the
      * new cursors will be returned as normal through nextReady().
      */
-    void addNewShardCursors(const std::vector<ClusterClientCursorParams::RemoteCursor>& newCursors);
+    void addNewShardCursors(std::vector<RemoteCursor>&& newCursors);
+
+    std::size_t getNumRemotes() const {
+        return _remotes.size();
+    }
 
     /**
      * Starts shutting down this ARM by canceling all pending requests and scheduling killCursors
@@ -202,6 +237,11 @@ public:
      * operation context.
      */
     executor::TaskExecutor::EventHandle kill(OperationContext* opCtx);
+
+    /**
+     * A blocking version of kill() that will not return until this is safe to destroy.
+     */
+    void blockingKill(OperationContext*);
 
 private:
     /**
@@ -275,7 +315,7 @@ private:
     private:
         const std::vector<RemoteCursorData>& _remotes;
 
-        const BSONObj& _sort;
+        const BSONObj _sort;
 
         // When '_compareWholeSortKey' is true, $sortKey is a scalar value, rather than an object.
         // We extract the sort key {$sortKey: <value>}. The sort key pattern '_sort' is verified to
@@ -371,6 +411,12 @@ private:
      */
     bool _haveOutstandingBatchRequests(WithLock);
 
+
+    /**
+     * Schedules a getMore on any remote hosts which we need another batch from.
+     */
+    Status _scheduleGetMores(WithLock);
+
     /**
      * Schedules a killCursors command to be run on all remote hosts that have open cursors.
      */
@@ -383,11 +429,8 @@ private:
 
     OperationContext* _opCtx;
     executor::TaskExecutor* _executor;
-    ClusterClientCursorParams* _params;
-
-    // The metadata obj to pass along with the command request. Used to indicate that the command is
-    // ok to run on secondaries.
-    BSONObj _metadataObj;
+    TailableModeEnum _tailableMode;
+    AsyncResultsMergerParams _params;
 
     // Must be acquired before accessing any data members (other than _params, which is read-only).
     stdx::mutex _mutex;

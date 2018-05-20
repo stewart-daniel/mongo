@@ -34,7 +34,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/assert_util.h"
 
@@ -60,9 +60,15 @@ bool AuthzSessionExternalStateMongod::shouldIgnoreAuthChecks() const {
 
 bool AuthzSessionExternalStateMongod::serverIsArbiter() const {
     // Arbiters have access to extra privileges under localhost. See SERVER-5479.
-    return (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
-                repl::ReplicationCoordinator::modeReplSet &&
-            repl::getGlobalReplicationCoordinator()->getMemberState().arbiter());
+    return (
+        repl::ReplicationCoordinator::get(getGlobalServiceContext())->getReplicationMode() ==
+            repl::ReplicationCoordinator::modeReplSet &&
+        repl::ReplicationCoordinator::get(getGlobalServiceContext())->getMemberState().arbiter());
+}
+
+MONGO_REGISTER_SHIM(AuthzSessionExternalState::create)
+(AuthorizationManager* const authzManager)->std::unique_ptr<AuthzSessionExternalState> {
+    return std::make_unique<AuthzSessionExternalStateMongod>(authzManager);
 }
 
 }  // namespace mongo

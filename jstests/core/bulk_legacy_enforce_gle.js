@@ -2,7 +2,9 @@
  * Tests the resetError logic when the bulk api enforces the write concern for unordered
  * writes. The tests indirectly checks whether resetError was called by inspecting the
  * response of the getLastError command after executing the bulk ops.
+ *
  */
+
 (function() {
     "use strict";
     const coll = db.bulk_legacy_enforce_gle;

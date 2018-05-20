@@ -72,8 +72,6 @@ void ReplicationCoordinatorExternalStateMock::startSteadyStateReplication(Operat
 
 void ReplicationCoordinatorExternalStateMock::stopDataReplication(OperationContext*) {}
 
-void ReplicationCoordinatorExternalStateMock::startMasterSlave(OperationContext*) {}
-
 Status ReplicationCoordinatorExternalStateMock::runRepairOnLocalDB(OperationContext* opCtx) {
     return Status::OK();
 }
@@ -92,15 +90,11 @@ executor::TaskExecutor* ReplicationCoordinatorExternalStateMock::getTaskExecutor
     return nullptr;
 }
 
-OldThreadPool* ReplicationCoordinatorExternalStateMock::getDbWorkThreadPool() const {
+ThreadPool* ReplicationCoordinatorExternalStateMock::getDbWorkThreadPool() const {
     return nullptr;
 }
 
 void ReplicationCoordinatorExternalStateMock::forwardSlaveProgress() {}
-
-OID ReplicationCoordinatorExternalStateMock::ensureMe(OperationContext*) {
-    return OID::gen();
-}
 
 bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host,
                                                      ServiceContext* const service) {
@@ -207,6 +201,8 @@ void ReplicationCoordinatorExternalStateMock::closeConnections() {
 
 void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationContext* opCtx) {}
 
+void ReplicationCoordinatorExternalStateMock::killAllTransactionCursors(OperationContext* opCtx) {}
+
 void ReplicationCoordinatorExternalStateMock::shardingOnStepDownHook() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
@@ -220,6 +216,8 @@ void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
 void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(
     const OpTime& newCommitPoint) {}
 
+void ReplicationCoordinatorExternalStateMock::updateLocalSnapshot(const OpTime& optime) {}
+
 bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
     return _areSnapshotsEnabled;
 }
@@ -230,6 +228,11 @@ void ReplicationCoordinatorExternalStateMock::setAreSnapshotsEnabled(bool val) {
 
 void ReplicationCoordinatorExternalStateMock::notifyOplogMetadataWaiters(
     const OpTime& committedOpTime) {}
+
+boost::optional<OpTime> ReplicationCoordinatorExternalStateMock::getEarliestDropPendingOpTime()
+    const {
+    return {};
+}
 
 double ReplicationCoordinatorExternalStateMock::getElectionTimeoutOffsetLimitFraction() const {
     return 0.15;
@@ -243,29 +246,6 @@ bool ReplicationCoordinatorExternalStateMock::isReadCommittedSupportedByStorageE
 bool ReplicationCoordinatorExternalStateMock::isReadConcernSnapshotSupportedByStorageEngine(
     OperationContext* opCtx) const {
     return true;
-}
-
-StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::multiApply(
-    OperationContext*, MultiApplier::Operations, MultiApplier::ApplyOperationFn) {
-    return {ErrorCodes::InternalError, "Method not implemented"};
-}
-
-Status ReplicationCoordinatorExternalStateMock::multiInitialSyncApply(
-    MultiApplier::OperationPtrs* ops,
-    const HostAndPort& source,
-    AtomicUInt32* fetchCount,
-    WorkerMultikeyPathInfo* workerMultikeyPathInfo) {
-    return Status::OK();
-}
-
-std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateMock::makeInitialSyncOplogBuffer(
-    OperationContext* opCtx) const {
-    return stdx::make_unique<OplogBufferBlockingQueue>();
-}
-
-std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateMock::makeSteadyStateOplogBuffer(
-    OperationContext* opCtx) const {
-    return stdx::make_unique<OplogBufferBlockingQueue>();
 }
 
 std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherMaxFetcherRestarts() const {
@@ -282,7 +262,7 @@ OpTime ReplicationCoordinatorExternalStateMock::onTransitionToPrimary(OperationC
                                                                       bool isV1ElectionProtocol) {
     _lastOpTime = _firstOpTimeOfMyTerm;
     _firstOpTimeOfMyTerm = OpTime();
-    return fassertStatusOK(40297, _lastOpTime);
+    return fassert(40297, _lastOpTime);
 }
 
 void ReplicationCoordinatorExternalStateMock::startNoopWriter(OpTime opTime) {}

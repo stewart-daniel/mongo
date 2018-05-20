@@ -54,7 +54,8 @@
 #include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/listen.h"  // For DEFAULT_MAX_CONN
+#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 
@@ -421,6 +422,20 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
         .hidden()
         .setSources(moe::SourceAllLegacy);
 
+    options
+        ->addOptionChaining("operationProfiling.slowOpThresholdMs",
+                            "slowms",
+                            moe::Int,
+                            "value of slow for profile and console log")
+        .setDefault(moe::Value(100));
+
+    options
+        ->addOptionChaining("operationProfiling.slowOpSampleRate",
+                            "slowOpSampleRate",
+                            moe::Double,
+                            "fraction of slow ops to include in the profile and console log")
+        .setDefault(moe::Value(1.0));
+
     auto ret = addMessageCompressionOptions(options, false);
     if (!ret.isOK()) {
         return ret;
@@ -603,13 +618,11 @@ Status validateServerOptions(const moe::Environment& params) {
         if (parameters.find("internalValidateFeaturesAsMaster") != parameters.end()) {
             // Command line options that are disallowed when internalValidateFeaturesAsMaster is
             // specified.
-            for (const auto& disallowedOption : {"replication.replSet", "master", "slave"}) {
-                if (params.count(disallowedOption)) {
-                    return Status(ErrorCodes::BadValue,
-                                  str::stream()
-                                      << "Cannot specify both internalValidateFeaturesAsMaster and "
-                                      << disallowedOption);
-                }
+            if (params.count("replication.replSet")) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() <<  //
+                                  "Cannot specify both internalValidateFeaturesAsMaster and "
+                                  "replication.replSet");
             }
         }
     }
@@ -1088,6 +1101,15 @@ Status storeServerOptions(const moe::Environment& params) {
         return Status(ErrorCodes::BadValue,
                       "--transitionToAuth must be used with keyFile or x509 authentication");
     }
+
+    if (params.count("operationProfiling.slowOpThresholdMs")) {
+        serverGlobalParams.slowMS = params["operationProfiling.slowOpThresholdMs"].as<int>();
+    }
+
+    if (params.count("operationProfiling.slowOpSampleRate")) {
+        serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
+    }
+
 #ifdef MONGO_CONFIG_SSL
     ret = storeSSLServerOptions(params);
     if (!ret.isOK()) {

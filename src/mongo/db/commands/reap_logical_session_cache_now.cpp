@@ -31,6 +31,7 @@
 #include "mongo/base/init.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/operation_context.h"
 
@@ -75,21 +76,13 @@ public:
         auto client = opCtx->getClient();
 
         auto res = cache->reapNow(client);
-        if (!res.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, res);
-        }
+        uassertStatusOK(res);
 
         return true;
     }
 };
 
-MONGO_INITIALIZER(RegisterReapLogicalSessionCacheNowCommand)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new ReapLogicalSessionCacheNowCommand();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(ReapLogicalSessionCacheNowCommand);
 
 }  // namespace
 

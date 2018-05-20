@@ -76,6 +76,8 @@ public:
 
     void updateFlags(OperationContext* opCtx, int newValue) final;
 
+    void updateIndexMetadata(OperationContext* opCtx, const IndexDescriptor* desc) final;
+
     void updateValidator(OperationContext* opCtx,
                          const BSONObj& validator,
                          StringData validationLevel,
@@ -86,8 +88,6 @@ public:
     void updateCappedSize(OperationContext*, long long int) final;
 
     void addUUID(OperationContext* opCtx, CollectionUUID uuid, Collection* coll) final;
-
-    void removeUUID(OperationContext* opCtx) final;
 
     bool isEqualToMetadataUUID(OperationContext* opCtx, OptionalCollectionUUID uuid) final;
 

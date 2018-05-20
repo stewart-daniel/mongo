@@ -91,6 +91,9 @@ public:
         const std::string& dbName,
         repl::ReadConcernLevel readConcernLevel) override;
 
+    StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> getAllDBs(
+        OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
+
     StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
         OperationContext* opCtx,
         const NamespaceString& nss,
@@ -101,6 +104,9 @@ public:
         const std::string* dbName,
         repl::OpTime* optime,
         repl::ReadConcernLevel readConcernLevel) override;
+
+    std::vector<NamespaceString> getAllShardedCollectionsForDb(
+        OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) override;
 
     StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
                                                               const ShardId& shardName) override;
@@ -165,14 +171,6 @@ public:
 
     DistLockManager* getDistLockManager() override;
 
-    /**
-     * Runs a read command against the config server with majority read concern.
-     */
-    bool runReadCommandForTest(OperationContext* opCtx,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               BSONObjBuilder* result);
-
     StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
         OperationContext* opCtx,
         StringData purpose,
@@ -215,11 +213,6 @@ private:
         const BSONObj& query,
         const BSONObj& sort,
         boost::optional<long long> limit) override;
-
-    /**
-     * Appends a read committed read concern to the request object.
-     */
-    void _appendReadConcern(BSONObjBuilder* builder);
 
     /**
      * Queries the config servers for the database metadata for the given database, using the

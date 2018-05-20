@@ -273,7 +273,7 @@ void encodeGeoMatchExpression(const GeoMatchExpression* tree, StringBuilder* key
     } else {
         error() << "unknown CRS type " << (int)geoQuery.getGeometry().getNativeCRS()
                 << " in geometry of type " << geoQuery.getGeometry().getDebugType();
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 }
 
@@ -303,7 +303,7 @@ void encodeGeoNearMatchExpression(const GeoNearMatchExpression* tree, StringBuil
         case UNSET:
             error() << "unknown CRS type " << (int)nearQuery.centroid->crs
                     << " in point geometry for near query";
-            invariant(false);
+            MONGO_UNREACHABLE;
             break;
     }
 }
@@ -352,11 +352,6 @@ bool PlanCache::shouldCacheQuery(const CanonicalQuery& query) {
 
     // Tailable cursors won't get cached, just turn into collscans.
     if (query.getQueryRequest().isTailable()) {
-        return false;
-    }
-
-    // Snapshot is really a hint.
-    if (query.getQueryRequest().isSnapshot()) {
         return false;
     }
 
@@ -581,6 +576,17 @@ void PlanCache::encodeKeyForMatch(const MatchExpression* tree, StringBuilder* ke
         encodeGeoMatchExpression(static_cast<const GeoMatchExpression*>(tree), keyBuilder);
     } else if (MatchExpression::GEO_NEAR == tree->matchType()) {
         encodeGeoNearMatchExpression(static_cast<const GeoNearMatchExpression*>(tree), keyBuilder);
+    }
+
+    // REGEX requires that we encode the flags so that regexes with different options appear
+    // as different query shapes.
+    if (MatchExpression::REGEX == tree->matchType()) {
+        const auto reMatchExpression = static_cast<const RegexMatchExpression*>(tree);
+        std::string flags = reMatchExpression->getFlags();
+        // Sort the flags, so that queries with the same regex flags in different orders will have
+        // the same shape.
+        std::sort(flags.begin(), flags.end());
+        encodeUserString(flags, keyBuilder);
     }
 
     // Encode indexability.

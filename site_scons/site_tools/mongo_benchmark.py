@@ -29,13 +29,15 @@ def build_benchmark(env, target, source, **kwargs):
 
     libdeps = kwargs.get('LIBDEPS', [])
     libdeps.append('$BUILD_DIR/mongo/unittest/benchmark_main')
-    libdeps.append('$BUILD_DIR/third_party/shim_benchmark')
 
     kwargs['LIBDEPS'] = libdeps
+    kwargs['INSTALL_ALIAS'] = ['benchmarks']
 
     result = bmEnv.Program(target, source, **kwargs)
     bmEnv.RegisterBenchmark(result[0])
-    bmEnv.Install("#/build/benchmark/", result[0])
+    hygienic = bmEnv.GetOption('install-mode') == 'hygienic'
+    if not hygienic:
+        bmEnv.Install("#/build/benchmark/", result[0])
     return result
 
 def generate(env):

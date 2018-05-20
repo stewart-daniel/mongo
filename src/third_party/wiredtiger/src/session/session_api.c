@@ -59,12 +59,22 @@ __wt_session_cursor_cache_sweep(WT_SESSION_IMPL *session)
 	WT_CURSOR *cursor, *cursor_tmp;
 	WT_CURSOR_LIST *cached_list;
 	WT_DECL_RET;
+	time_t now;
 	uint32_t position;
 	int i, t_ret, nbuckets, nexamined, nclosed;
 	bool productive;
 
 	if (!F_ISSET(session, WT_SESSION_CACHE_CURSORS))
 		return (0);
+
+	/*
+	 * Periodically sweep for dead cursors; if we've swept recently, don't
+	 * do it again.
+	 */
+	__wt_seconds(session, &now);
+	if (difftime(now, session->last_cursor_sweep) < 1)
+		return (0);
+	session->last_cursor_sweep = now;
 
 	position = session->cursor_sweep_position;
 	productive = true;
@@ -93,13 +103,12 @@ __wt_session_cursor_cache_sweep(WT_SESSION_IMPL *session)
 
 		/*
 		 * We continue sweeping as long as we have some good average
-		 * productivity. At a minimum, we look at two buckets.
+		 * productivity, or we are under the minimum.
 		 */
-		productive = (nclosed >= i);
+		productive = (nclosed + WT_SESSION_CURSOR_SWEEP_MIN > i);
 	}
 
 	session->cursor_sweep_position = position;
-	session->cursor_sweep_countdown = WT_SESSION_CURSOR_SWEEP_COUNTDOWN;
 	F_SET(session, WT_SESSION_CACHE_CURSORS);
 
 	WT_STAT_CONN_INCR(session, cursor_sweep);
@@ -147,6 +156,9 @@ int
 __wt_session_release_resources(WT_SESSION_IMPL *session)
 {
 	WT_DECL_RET;
+
+	/* Transaction cleanup */
+	__wt_txn_release_resources(session);
 
 	/* Block manager cleanup */
 	if (session->block_manager_cleanup != NULL)
@@ -395,8 +407,7 @@ __session_reconfigure(WT_SESSION *wt_session, const char *config)
 	 * Indicated as allowed in prepared state, even though not allowed,
 	 * so that running transaction check below take precedence.
 	 */
-	SESSION_API_CALL_PREPARE_ALLOWED(
-	    session, reconfigure, config, cfg);
+	SESSION_API_CALL_PREPARE_ALLOWED(session, reconfigure, config, cfg);
 
 	/*
 	 * Note that this method only checks keys that are passed in by the
@@ -567,9 +578,10 @@ __wt_open_cursor(WT_SESSION_IMPL *session,
 {
 	WT_DECL_RET;
 
-	if (F_ISSET(session, WT_SESSION_CACHE_CURSORS)) {
+	/* We do not cache any subordinate tables/files cursors. */
+	if (owner == NULL) {
 		if ((ret = __wt_cursor_cache_get(
-		    session, uri, owner, cfg, cursorp)) == 0)
+		    session, uri, NULL, cfg, cursorp)) == 0)
 			return (0);
 		WT_RET_NOTFOUND_OK(ret);
 	}
@@ -596,35 +608,37 @@ __session_open_cursor(WT_SESSION *wt_session,
 	session = (WT_SESSION_IMPL *)wt_session;
 	SESSION_API_CALL(session, open_cursor, config, cfg);
 
-	if (to_dup == NULL && F_ISSET(session, WT_SESSION_CACHE_CURSORS)) {
-		if ((ret = __wt_cursor_cache_get(
-		    session, uri, NULL, cfg, cursorp)) == 0)
-			return (0);
-		WT_RET_NOTFOUND_OK(ret);
-	}
-
 	statjoin = (to_dup != NULL && uri != NULL &&
 	    WT_STREQ(uri, "statistics:join"));
-	if ((to_dup == NULL && uri == NULL) ||
-	    (to_dup != NULL && uri != NULL && !statjoin))
-		WT_ERR_MSG(session, EINVAL,
-		    "should be passed either a URI or a cursor to duplicate, "
-		    "but not both");
+	if (!statjoin) {
+		if ((to_dup == NULL && uri == NULL) ||
+		    (to_dup != NULL && uri != NULL))
+			WT_ERR_MSG(session, EINVAL,
+			    "should be passed either a URI or a cursor to "
+			    "duplicate, but not both");
 
-	if (to_dup != NULL && !statjoin) {
-		uri = to_dup->uri;
-		if (!WT_PREFIX_MATCH(uri, "colgroup:") &&
-		    !WT_PREFIX_MATCH(uri, "index:") &&
-		    !WT_PREFIX_MATCH(uri, "file:") &&
-		    !WT_PREFIX_MATCH(uri, "lsm:") &&
-		    !WT_PREFIX_MATCH(uri, WT_METADATA_URI) &&
-		    !WT_PREFIX_MATCH(uri, "table:") &&
-		    __wt_schema_get_source(session, uri) == NULL)
-			WT_ERR(__wt_bad_object_type(session, uri));
+		if ((ret = __wt_cursor_cache_get(
+		    session, uri, to_dup, cfg, &cursor)) == 0)
+			goto done;
+		WT_ERR_NOTFOUND_OK(ret);
+
+		if (to_dup != NULL) {
+			uri = to_dup->uri;
+			if (!WT_PREFIX_MATCH(uri, "colgroup:") &&
+			    !WT_PREFIX_MATCH(uri, "index:") &&
+			    !WT_PREFIX_MATCH(uri, "file:") &&
+			    !WT_PREFIX_MATCH(uri, "lsm:") &&
+			    !WT_PREFIX_MATCH(uri, WT_METADATA_URI) &&
+			    !WT_PREFIX_MATCH(uri, "table:") &&
+			    __wt_schema_get_source(session, uri) == NULL)
+				WT_ERR(__wt_bad_object_type(session, uri));
+		}
 	}
 
 	WT_ERR(__session_open_cursor_int(session, uri, NULL,
 	    statjoin ? to_dup : NULL, cfg, &cursor));
+
+done:
 	if (to_dup != NULL && !statjoin)
 		WT_ERR(__wt_cursor_dup_position(to_dup, cursor));
 
@@ -634,7 +648,6 @@ __session_open_cursor(WT_SESSION *wt_session,
 err:		if (cursor != NULL)
 			WT_TRET(cursor->close(cursor));
 	}
-
 	/*
 	 * Opening a cursor on a non-existent data source will set ret to
 	 * either of ENOENT or WT_NOTFOUND at this point. However,
@@ -678,8 +691,7 @@ __session_alter(WT_SESSION *wt_session, const char *uri, const char *config)
 	cfg[1] = NULL;
 	WT_WITH_CHECKPOINT_LOCK(session,
 	    WT_WITH_SCHEMA_LOCK(session,
-		ret = __wt_schema_worker(session, uri, __wt_alter, NULL, cfg,
-		WT_BTREE_ALTER | WT_DHANDLE_EXCLUSIVE)));
+		ret = __wt_schema_alter(session, uri, cfg)));
 
 err:
 	if (ret != 0)
@@ -1422,8 +1434,11 @@ __wt_session_range_truncate(WT_SESSION_IMPL *session,
 
 done:
 err:	/*
-	 * Close any locally-opened start cursor. Reset application cursors,
-	 * they've possibly moved and the application cannot use them.
+	 * Close any locally-opened start cursor.
+	 *
+	 * Reset application cursors, they've possibly moved and the
+	 * application cannot use them.  Note that we can make it here with a
+	 * NULL start cursor (e.g., if the truncate range is empty).
 	 */
 	if (local_start)
 		WT_TRET(start->close(start));
@@ -1645,9 +1660,14 @@ __session_commit_transaction(WT_SESSION *wt_session, const char *config)
 	    session, commit_transaction, config, cfg);
 	WT_STAT_CONN_INCR(session, txn_commit);
 
+	txn = &session->txn;
+	if (F_ISSET(txn, WT_TXN_PREPARE)) {
+		WT_STAT_CONN_INCR(session, txn_prepare_commit);
+		WT_STAT_CONN_DECR(session, txn_prepare_active);
+	}
+
 	WT_ERR(__wt_txn_context_check(session, true));
 
-	txn = &session->txn;
 	if (F_ISSET(txn, WT_TXN_ERROR) && txn->mod_count != 0)
 		WT_ERR_MSG(session, EINVAL,
 		    "failed transaction requires rollback%s%s",
@@ -1677,6 +1697,8 @@ __session_prepare_transaction(WT_SESSION *wt_session, const char *config)
 
 	session = (WT_SESSION_IMPL *)wt_session;
 	SESSION_API_CALL(session, prepare_transaction, config, cfg);
+	WT_STAT_CONN_INCR(session, txn_prepare);
+	WT_STAT_CONN_INCR(session, txn_prepare_active);
 
 	WT_ERR(__wt_txn_context_check(session, true));
 
@@ -1726,11 +1748,18 @@ __session_rollback_transaction(WT_SESSION *wt_session, const char *config)
 {
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
+	WT_TXN *txn;
 
 	session = (WT_SESSION_IMPL *)wt_session;
 	SESSION_API_CALL_PREPARE_ALLOWED(
 	    session, rollback_transaction, config, cfg);
 	WT_STAT_CONN_INCR(session, txn_rollback);
+
+	txn = &session->txn;
+	if (F_ISSET(txn, WT_TXN_PREPARE)) {
+		WT_STAT_CONN_INCR(session, txn_prepare_rollback);
+		WT_STAT_CONN_DECR(session, txn_prepare_active);
+	}
 
 	WT_ERR(__wt_txn_context_check(session, true));
 
@@ -1927,8 +1956,7 @@ __session_checkpoint(WT_SESSION *wt_session, const char *config)
 	 * Indicated as allowed in prepared state, even though not allowed,
 	 * so that running transaction check below take precedence.
 	 */
-	SESSION_API_CALL_PREPARE_ALLOWED(
-	    session, checkpoint, config, cfg);
+	SESSION_API_CALL_PREPARE_ALLOWED(session, checkpoint, config, cfg);
 
 	WT_ERR(__wt_inmem_unsupported_op(session, NULL));
 
@@ -2211,6 +2239,11 @@ __open_session(WT_CONNECTION_IMPL *conn,
 		    session, WT_OPTRACK_BUFSIZE, &session_ret->optrack_buf));
 		session_ret->optrackbuf_ptr = 0;
 	}
+
+	/* Set the default value for session flags. */
+	if (F_ISSET(conn, WT_CONN_CACHE_CURSORS))
+		F_SET(session_ret, WT_SESSION_CACHE_CURSORS);
+
 	/*
 	 * Configuration: currently, the configuration for open_session is the
 	 * same as session.reconfigure, so use that function.

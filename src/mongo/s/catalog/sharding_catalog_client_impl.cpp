@@ -35,14 +35,10 @@
 #include <iomanip>
 #include <pcrecpp.h>
 
-#include "mongo/base/status.h"
-#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter.h"
-#include "mongo/client/replica_set_monitor.h"
-#include "mongo/db/audit.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
@@ -51,7 +47,6 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/executor/network_interface.h"
-#include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/s/catalog/config_server_version.h"
@@ -64,7 +59,6 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -282,6 +276,40 @@ StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::getDatabas
     return result;
 }
 
+StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> ShardingCatalogClientImpl::getAllDBs(
+    OperationContext* opCtx, repl::ReadConcernLevel readConcern) {
+    std::vector<DatabaseType> databases;
+    auto findStatus = _exhaustiveFindOnConfig(opCtx,
+                                              kConfigReadSelector,
+                                              readConcern,
+                                              DatabaseType::ConfigNS,
+                                              BSONObj(),     // no query filter
+                                              BSONObj(),     // no sort
+                                              boost::none);  // no limit
+    if (!findStatus.isOK()) {
+        return findStatus.getStatus();
+    }
+
+    for (const BSONObj& doc : findStatus.getValue().value) {
+        auto dbRes = DatabaseType::fromBSON(doc);
+        if (!dbRes.isOK()) {
+            return dbRes.getStatus().withContext(stream() << "Failed to parse database document "
+                                                          << doc);
+        }
+
+        Status validateStatus = dbRes.getValue().validate();
+        if (!validateStatus.isOK()) {
+            return validateStatus.withContext(stream() << "Failed to validate database document "
+                                                       << doc);
+        }
+
+        databases.push_back(dbRes.getValue());
+    }
+
+    return repl::OpTimeWith<std::vector<DatabaseType>>{std::move(databases),
+                                                       findStatus.getValue().opTime};
+}
+
 StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::_fetchDatabaseMetadata(
     OperationContext* opCtx,
     const std::string& dbName,
@@ -396,6 +424,24 @@ StatusWith<std::vector<CollectionType>> ShardingCatalogClientImpl::getCollection
     }
 
     return collections;
+}
+
+std::vector<NamespaceString> ShardingCatalogClientImpl::getAllShardedCollectionsForDb(
+    OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) {
+    const auto dbNameStr = dbName.toString();
+
+    const std::vector<CollectionType> collectionsOnConfig =
+        uassertStatusOK(getCollections(opCtx, &dbNameStr, nullptr, readConcern));
+
+    std::vector<NamespaceString> collectionsToReturn;
+    for (const auto& coll : collectionsOnConfig) {
+        if (coll.getDropped())
+            continue;
+
+        collectionsToReturn.push_back(coll.getNs());
+    }
+
+    return collectionsToReturn;
 }
 
 StatusWith<BSONObj> ShardingCatalogClientImpl::getGlobalSettings(OperationContext* opCtx,
@@ -611,12 +657,12 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
         if (initialCmdHadWriteConcern) {
             Status status = writeConcern.parse(writeConcernElement.Obj());
             if (!status.isOK()) {
-                return CommandHelpers::appendCommandStatus(*result, status);
+                return CommandHelpers::appendCommandStatusNoThrow(*result, status);
             }
 
             if (!(writeConcern.wNumNodes == 1 ||
                   writeConcern.wMode == WriteConcernOptions::kMajority)) {
-                return CommandHelpers::appendCommandStatus(
+                return CommandHelpers::appendCommandStatusNoThrow(
                     *result,
                     {ErrorCodes::InvalidOptions,
                      str::stream() << "Invalid replication write concern. User management write "
@@ -655,36 +701,19 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
             Shard::RetryPolicy::kNotIdempotent);
 
     if (!response.isOK()) {
-        return CommandHelpers::appendCommandStatus(*result, response.getStatus());
+        return CommandHelpers::appendCommandStatusNoThrow(*result, response.getStatus());
     }
     if (!response.getValue().commandStatus.isOK()) {
-        return CommandHelpers::appendCommandStatus(*result, response.getValue().commandStatus);
+        return CommandHelpers::appendCommandStatusNoThrow(*result,
+                                                          response.getValue().commandStatus);
     }
     if (!response.getValue().writeConcernStatus.isOK()) {
-        return CommandHelpers::appendCommandStatus(*result, response.getValue().writeConcernStatus);
+        return CommandHelpers::appendCommandStatusNoThrow(*result,
+                                                          response.getValue().writeConcernStatus);
     }
 
     CommandHelpers::filterCommandReplyForPassthrough(response.getValue().response, result);
     return true;
-}
-
-bool ShardingCatalogClientImpl::runReadCommandForTest(OperationContext* opCtx,
-                                                      const std::string& dbname,
-                                                      const BSONObj& cmdObj,
-                                                      BSONObjBuilder* result) {
-    BSONObjBuilder cmdBuilder;
-    cmdBuilder.appendElements(cmdObj);
-    _appendReadConcern(&cmdBuilder);
-
-    auto resultStatus =
-        Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
-            opCtx, kConfigReadSelector, dbname, cmdBuilder.done(), Shard::RetryPolicy::kIdempotent);
-    if (resultStatus.isOK()) {
-        result->appendElements(resultStatus.getValue().response);
-        return resultStatus.getValue().commandStatus.isOK();
-    }
-
-    return CommandHelpers::appendCommandStatus(*result, resultStatus.getStatus());
 }
 
 bool ShardingCatalogClientImpl::runUserManagementReadCommand(OperationContext* opCtx,
@@ -704,7 +733,7 @@ bool ShardingCatalogClientImpl::runUserManagementReadCommand(OperationContext* o
         return resultStatus.getValue().commandStatus.isOK();
     }
 
-    return CommandHelpers::appendCommandStatus(*result, resultStatus.getStatus());
+    return CommandHelpers::appendCommandStatusNoThrow(*result, resultStatus.getStatus());  // XXX
 }
 
 Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCtx,
@@ -717,9 +746,9 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
     invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||
               (readConcern == repl::ReadConcernLevel::kMajorityReadConcern &&
                writeConcern.wMode == WriteConcernOptions::kMajority));
-    BSONObj cmd = BSON("doTxn" << updateOps << "preCondition" << preCondition
-                               << WriteConcernOptions::kWriteConcernField
-                               << writeConcern.toBSON());
+    BSONObj cmd = BSON("applyOps" << updateOps << "preCondition" << preCondition
+                                  << WriteConcernOptions::kWriteConcernField
+                                  << writeConcern.toBSON());
 
     auto response =
         Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
@@ -761,27 +790,31 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
         BSONObjBuilder query;
         lastChunkVersion.addToBSON(query, ChunkType::lastmod());
         query.append(ChunkType::ns(), nss.ns());
-        auto swChunks = getChunks(opCtx, query.obj(), BSONObj(), 1, nullptr, readConcern);
-        const auto& newestChunk = swChunks.getValue();
+        auto chunkWithStatus = getChunks(opCtx, query.obj(), BSONObj(), 1, nullptr, readConcern);
 
-        if (!swChunks.isOK()) {
-            errMsg = str::stream() << "getChunks function failed, unable to validate chunk "
-                                   << "operation metadata: " << swChunks.getStatus().toString()
-                                   << ". applyChunkOpsDeprecated failed to get confirmation "
-                                   << "of commit. Unable to save chunk ops. Command: " << cmd
-                                   << ". Result: " << response.getValue().response;
-        } else if (!newestChunk.empty()) {
-            invariant(newestChunk.size() == 1);
-            return Status::OK();
-        } else {
+        if (!chunkWithStatus.isOK()) {
+            errMsg = str::stream()
+                << "getChunks function failed, unable to validate chunk "
+                << "operation metadata: " << chunkWithStatus.getStatus().toString()
+                << ". applyChunkOpsDeprecated failed to get confirmation "
+                << "of commit. Unable to save chunk ops. Command: " << cmd
+                << ". Result: " << response.getValue().response;
+            return status.withContext(errMsg);
+        };
+
+        const auto& newestChunk = chunkWithStatus.getValue();
+
+        if (newestChunk.empty()) {
             errMsg = str::stream() << "chunk operation commit failed: version "
                                    << lastChunkVersion.toString()
                                    << " doesn't exist in namespace: " << nss.ns()
                                    << ". Unable to save chunk ops. Command: " << cmd
                                    << ". Result: " << response.getValue().response;
-        }
+            return status.withContext(errMsg);
+        };
 
-        return status.withContext(errMsg);
+        invariant(newestChunk.size() == 1);
+        return Status::OK();
     }
 
     return Status::OK();
@@ -1003,12 +1036,6 @@ StatusWith<repl::OpTimeWith<vector<BSONObj>>> ShardingCatalogClientImpl::_exhaus
 
     return repl::OpTimeWith<vector<BSONObj>>(std::move(response.getValue().docs),
                                              response.getValue().opTime);
-}
-
-void ShardingCatalogClientImpl::_appendReadConcern(BSONObjBuilder* builder) {
-    repl::ReadConcernArgs readConcern(grid.configOpTime(),
-                                      repl::ReadConcernLevel::kMajorityReadConcern);
-    readConcern.appendInfo(builder);
 }
 
 StatusWith<std::vector<KeysCollectionDocument>> ShardingCatalogClientImpl::getNewKeys(

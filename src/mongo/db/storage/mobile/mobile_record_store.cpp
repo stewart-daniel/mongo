@@ -466,7 +466,7 @@ Status MobileRecordStore::updateRecord(OperationContext* opCtx,
     _changeDataSize(opCtx, -dataSizeBefore + len);
 
     if (notifier) {
-        fassertStatusOK(37054, notifier->recordStoreGoingToUpdateInPlace(opCtx, recId));
+        fassert(37054, notifier->recordStoreGoingToUpdateInPlace(opCtx, recId));
     }
 
     std::string updateQuery = "UPDATE \"" + _ident + "\" SET data = ? " + "WHERE rec_id = ?;";
@@ -681,7 +681,7 @@ class MobileRecordStore::NumRecsChange final : public RecoveryUnit::Change {
 public:
     NumRecsChange(MobileRecordStore* rs, int64_t diff) : _rs(rs), _diff(diff) {}
 
-    void commit() override {}
+    void commit(boost::optional<Timestamp>) override {}
 
     void rollback() override {
         stdx::lock_guard<stdx::mutex> lock(_rs->_numRecsMutex);
@@ -718,7 +718,7 @@ class MobileRecordStore::DataSizeChange final : public RecoveryUnit::Change {
 public:
     DataSizeChange(MobileRecordStore* rs, int64_t diff) : _rs(rs), _diff(diff) {}
 
-    void commit() override {}
+    void commit(boost::optional<Timestamp>) override {}
 
     void rollback() override {
         stdx::lock_guard<stdx::mutex> lock(_rs->_dataSizeMutex);

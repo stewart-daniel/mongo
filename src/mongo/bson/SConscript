@@ -28,6 +28,7 @@ env.CppUnitTest(
     target='bson_obj_test',
     source=[
         'bson_obj_test.cpp',
+        'simple_bsonobj_comparator_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -93,6 +94,7 @@ asioEnv.CppIntegrationTest(
         'ugly_bson_integration_test.cpp'
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/executor/network_interface_asio_fixture',
+        '$BUILD_DIR/mongo/executor/network_interface_fixture',
+        '$BUILD_DIR/mongo/rpc/protocol'
     ],
 )

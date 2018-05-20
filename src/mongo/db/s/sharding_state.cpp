@@ -37,7 +37,7 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context.h"
@@ -45,6 +45,7 @@
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
@@ -64,11 +65,6 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-using std::shared_ptr;
-using std::string;
-using std::vector;
-
 namespace {
 
 const auto getShardingState = ServiceContext::declareDecoration<ShardingState>();
@@ -81,7 +77,8 @@ const auto getShardingState = ServiceContext::declareDecoration<ShardingState>()
  * One example use case is for the ReplicaSetMonitor asynchronous callback when it detects changes
  * to replica set membership.
  */
-void updateShardIdentityConfigStringCB(const string& setName, const string& newConnectionString) {
+void updateShardIdentityConfigStringCB(const std::string& setName,
+                                       const std::string& newConnectionString) {
     auto configsvrConnStr = grid.shardRegistry()->getConfigServerConnectionString();
     if (configsvrConnStr.getSetName() != setName) {
         // Ignore all change notification for other sets that are not the config server.
@@ -102,8 +99,7 @@ void updateShardIdentityConfigStringCB(const string& setName, const string& newC
 }  // namespace
 
 ShardingState::ShardingState()
-    : _chunkSplitter(stdx::make_unique<ChunkSplitter>()),
-      _initializationState(static_cast<uint32_t>(InitializationState::kNew)),
+    : _initializationState(static_cast<uint32_t>(InitializationState::kNew)),
       _initializationStatus(Status(ErrorCodes::InternalError, "Uninitialized value")),
       _globalInit(&initializeGlobalShardingStateForMongod) {}
 
@@ -139,7 +135,7 @@ Status ShardingState::canAcceptShardedCommands() const {
     }
 }
 
-string ShardingState::getShardName() {
+std::string ShardingState::getShardName() {
     invariant(enabled());
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _shardName;
@@ -171,18 +167,6 @@ Status ShardingState::updateConfigServerOpTimeFromMetadata(OperationContext* opC
     }
 
     return Status::OK();
-}
-
-ChunkSplitter* ShardingState::getChunkSplitter() {
-    return _chunkSplitter.get();
-}
-
-void ShardingState::initiateChunkSplitter() {
-    _chunkSplitter->initiateChunkSplitter();
-}
-
-void ShardingState::interruptChunkSplitter() {
-    _chunkSplitter->interruptChunkSplitter();
 }
 
 void ShardingState::setGlobalInitMethodForTest(GlobalInitFunc func) {
@@ -230,8 +214,6 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* opCtx,
                               << causedBy(_initializationStatus)};
     }
 
-    ShardedConnectionInfo::addHook(opCtx->getServiceContext());
-
     try {
         Status status = _globalInit(opCtx, configSvrConnStr, generateDistLockProcessId(opCtx));
         if (status.isOK()) {
@@ -249,8 +231,7 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* opCtx,
                                repl::MemberState::RS_PRIMARY);
 
             CatalogCacheLoader::get(opCtx).initializeReplicaSetRole(isStandaloneOrPrimary);
-
-            _chunkSplitter->setReplicaSetMode(isStandaloneOrPrimary);
+            ChunkSplitter::get(opCtx).setReplicaSetMode(isStandaloneOrPrimary);
 
             log() << "initialized sharding components for "
                   << (isStandaloneOrPrimary ? "primary" : "secondary") << " node.";
@@ -390,33 +371,6 @@ StatusWith<bool> ShardingState::initializeShardingAwarenessIfNeeded(OperationCon
     }
 }
 
-StatusWith<ScopedDonateChunk> ShardingState::registerDonateChunk(const MoveChunkRequest& args) {
-    return _activeMigrationsRegistry.registerDonateChunk(args);
-}
-
-StatusWith<ScopedReceiveChunk> ShardingState::registerReceiveChunk(const NamespaceString& nss,
-                                                                   const ChunkRange& chunkRange,
-                                                                   const ShardId& fromShardId) {
-    return _activeMigrationsRegistry.registerReceiveChunk(nss, chunkRange, fromShardId);
-}
-
-boost::optional<NamespaceString> ShardingState::getActiveDonateChunkNss() {
-    return _activeMigrationsRegistry.getActiveDonateChunkNss();
-}
-
-BSONObj ShardingState::getActiveMigrationStatusReport(OperationContext* opCtx) {
-    return _activeMigrationsRegistry.getActiveMigrationStatusReport(opCtx);
-}
-
-StatusWith<ScopedMovePrimary> ShardingState::registerMovePrimary(
-    const ShardMovePrimary& requestArgs) {
-    return _activeMovePrimariesRegistry.registerMovePrimary(requestArgs);
-}
-
-boost::optional<NamespaceString> ShardingState::getActiveMovePrimaryNss() {
-    return _activeMovePrimariesRegistry.getActiveMovePrimaryNss();
-}
-
 void ShardingState::appendInfo(OperationContext* opCtx, BSONObjBuilder& builder) {
     const bool isEnabled = enabled();
     builder.appendBool("enabled", isEnabled);
@@ -431,7 +385,7 @@ void ShardingState::appendInfo(OperationContext* opCtx, BSONObjBuilder& builder)
     builder.append("clusterId", _clusterId);
 }
 
-bool ShardingState::needCollectionMetadata(OperationContext* opCtx, const string& ns) {
+bool ShardingState::needCollectionMetadata(OperationContext* opCtx, const std::string& ns) {
     if (!enabled())
         return false;
 

@@ -37,7 +37,7 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/jsobj.h"
@@ -79,7 +79,7 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
     {
         AutoGetCollection autoColl(opCtx, ns, MODE_IX);
         const auto css = CollectionShardingState::get(opCtx, ns);
-        auto metadata = css->getMetadata();
+        auto metadata = css->getMetadata(opCtx);
         if (!metadata) {
             log() << "skipping orphaned data cleanup for " << ns.toString()
                   << ", collection is not sharded";

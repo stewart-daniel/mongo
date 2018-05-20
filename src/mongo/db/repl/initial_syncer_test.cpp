@@ -34,8 +34,9 @@
 
 #include "mongo/client/fetcher.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/json.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/repl/base_cloner_test_fixture.h"
 #include "mongo/db/repl/data_replicator_external_state_mock.h"
@@ -58,8 +59,8 @@
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/stdx/mutex.h"
-#include "mongo/util/concurrency/old_thread_pool.h"
 #include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
@@ -226,10 +227,6 @@ public:
         return *_storageInterface;
     }
 
-    OldThreadPool& getDbWorkThreadPool() {
-        return *_dbWorkThreadPool;
-    }
-
 protected:
     struct StorageInterfaceResults {
         bool createOplogCalled = false;
@@ -239,10 +236,8 @@ protected:
         bool droppedUserDBs = false;
         std::vector<std::string> droppedCollections;
         int documentsInsertedCount = 0;
-        bool schemaUpgraded = false;
-        OptionalCollectionUUID uuid;
-        bool getCollectionUUIDShouldFail = false;
-        bool upgradeUUIDSchemaVersionNonReplicatedShouldFail = false;
+        bool uniqueIndexUpdated = false;
+        bool upgradeNonReplicatedUniqueIndexesShouldFail = false;
     };
 
     stdx::mutex _storageInterfaceWorkDoneMutex;  // protects _storageInterfaceWorkDone.
@@ -255,10 +250,8 @@ protected:
                                                   const NamespaceString& nss) {
             LockGuard lock(_storageInterfaceWorkDoneMutex);
             _storageInterfaceWorkDone.createOplogCalled = true;
-            _storageInterfaceWorkDone.schemaUpgraded = false;
-            _storageInterfaceWorkDone.uuid = boost::none;
-            _storageInterfaceWorkDone.getCollectionUUIDShouldFail = false;
-            _storageInterfaceWorkDone.upgradeUUIDSchemaVersionNonReplicatedShouldFail = false;
+            _storageInterfaceWorkDone.uniqueIndexUpdated = false;
+            _storageInterfaceWorkDone.upgradeNonReplicatedUniqueIndexesShouldFail = false;
             return Status::OK();
         };
         _storageInterface->truncateCollFn = [this](OperationContext* opCtx,
@@ -268,7 +261,7 @@ protected:
             return Status::OK();
         };
         _storageInterface->insertDocumentFn = [this](OperationContext* opCtx,
-                                                     const NamespaceString& nss,
+                                                     const NamespaceStringOrUUID& nsOrUUID,
                                                      const TimestampedBSONObj& doc,
                                                      long long term) {
             LockGuard lock(_storageInterfaceWorkDoneMutex);
@@ -276,7 +269,7 @@ protected:
             return Status::OK();
         };
         _storageInterface->insertDocumentsFn = [this](OperationContext* opCtx,
-                                                      const NamespaceString& nss,
+                                                      const NamespaceStringOrUUID& nsOrUUID,
                                                       const std::vector<InsertStatement>& ops) {
             LockGuard lock(_storageInterfaceWorkDoneMutex);
             _storageInterfaceWorkDone.insertedOplogEntries = true;
@@ -311,37 +304,22 @@ protected:
                 return StatusWith<std::unique_ptr<CollectionBulkLoader>>(
                     std::unique_ptr<CollectionBulkLoader>(collInfo->loader));
             };
-        _storageInterface->getCollectionUUIDFn = [this](OperationContext* opCtx,
-                                                        const NamespaceString& nss) {
+        _storageInterface->upgradeNonReplicatedUniqueIndexesFn = [this](OperationContext* opCtx) {
             LockGuard lock(_storageInterfaceWorkDoneMutex);
-            if (_storageInterfaceWorkDone.getCollectionUUIDShouldFail) {
-                // getCollectionUUID returns NamespaceNotFound if either the db or the collection is
-                // missing.
-                return StatusWith<OptionalCollectionUUID>(Status(
-                    ErrorCodes::NamespaceNotFound,
-                    str::stream() << "getCollectionUUID failed because namespace " << nss.ns()
-                                  << " not found."));
+            if (_storageInterfaceWorkDone.upgradeNonReplicatedUniqueIndexesShouldFail) {
+                // One of the status codes a failed upgradeNonReplicatedUniqueIndexes call
+                // can return is NamespaceNotFound.
+                return Status(ErrorCodes::NamespaceNotFound,
+                              "upgradeNonReplicatedUniqueIndexes failed because the desired "
+                              "ns was not found.");
             } else {
-                return StatusWith<OptionalCollectionUUID>(_storageInterfaceWorkDone.uuid);
+                _storageInterfaceWorkDone.uniqueIndexUpdated = true;
+                return Status::OK();
             }
         };
 
-        _storageInterface->upgradeUUIDSchemaVersionNonReplicatedFn =
-            [this](OperationContext* opCtx) {
-                LockGuard lock(_storageInterfaceWorkDoneMutex);
-                if (_storageInterfaceWorkDone.upgradeUUIDSchemaVersionNonReplicatedShouldFail) {
-                    // One of the status codes a failed upgradeUUIDSchemaVersionNonReplicated call
-                    // can return is NamespaceNotFound.
-                    return Status(ErrorCodes::NamespaceNotFound,
-                                  "upgradeUUIDSchemaVersionNonReplicated failed because the "
-                                  "desired ns was not found.");
-                } else {
-                    _storageInterfaceWorkDone.schemaUpgraded = true;
-                    return Status::OK();
-                }
-            };
-
-        _dbWorkThreadPool = stdx::make_unique<OldThreadPool>(1);
+        _dbWorkThreadPool = stdx::make_unique<ThreadPool>(ThreadPool::Options());
+        _dbWorkThreadPool->startup();
 
         Client::initThreadIfNotAlready();
         reset();
@@ -365,7 +343,6 @@ protected:
             _setMyLastOptime(opTime, consistency);
         };
         options.resetOptimes = [this]() { _myLastOpTime = OpTime(); };
-        options.getSlaveDelay = [this]() { return Seconds(0); };
         options.syncSourceSelector = this;
 
         _options = options;
@@ -380,7 +357,6 @@ protected:
 
         auto dataReplicatorExternalState = stdx::make_unique<DataReplicatorExternalStateMock>();
         dataReplicatorExternalState->taskExecutor = _executorProxy.get();
-        dataReplicatorExternalState->dbWorkThreadPool = &getDbWorkThreadPool();
         dataReplicatorExternalState->currentTerm = 1LL;
         dataReplicatorExternalState->lastCommittedOpTime = _myLastOpTime;
         {
@@ -412,6 +388,7 @@ protected:
             _initialSyncer = stdx::make_unique<InitialSyncer>(
                 options,
                 std::move(dataReplicatorExternalState),
+                _dbWorkThreadPool.get(),
                 _storageInterface.get(),
                 _replicationProcess.get(),
                 [this](const StatusWith<OpTimeWithHash>& lastApplied) {
@@ -439,7 +416,6 @@ protected:
     void tearDown() override {
         tearDownExecutorThread();
         _initialSyncer.reset();
-        _dbWorkThreadPool->join();
         _dbWorkThreadPool.reset();
         _replicationProcess.reset();
         _storageInterface.reset();
@@ -464,8 +440,8 @@ protected:
 
     void runInitialSyncWithBadFCVResponse(std::vector<BSONObj> docs,
                                           ErrorCodes::Error expectedError);
-    void doSuccessfulInitialSyncWithOneBatch();
-    OplogEntry doInitialSyncWithOneBatch();
+    void doSuccessfulInitialSyncWithOneBatch(bool shouldSetFCV);
+    OplogEntry doInitialSyncWithOneBatch(bool shouldSetFCV);
 
     std::unique_ptr<TaskExecutorMock> _executorProxy;
 
@@ -475,7 +451,7 @@ protected:
     std::unique_ptr<SyncSourceSelectorMock> _syncSourceSelector;
     std::unique_ptr<StorageInterfaceMock> _storageInterface;
     std::unique_ptr<ReplicationProcess> _replicationProcess;
-    std::unique_ptr<OldThreadPool> _dbWorkThreadPool;
+    std::unique_ptr<ThreadPool> _dbWorkThreadPool;
     std::map<NamespaceString, CollectionMockStats> _collectionStats;
     std::map<NamespaceString, CollectionCloneInfo> _collections;
 
@@ -580,6 +556,7 @@ OplogEntry makeOplogEntry(int t,
                       oField,                      // o
                       boost::none,                 // o2
                       {},                          // sessionInfo
+                      boost::none,                 // upsert
                       boost::none,                 // wall clock time
                       boost::none,                 // statement id
                       boost::none,   // optime of previous write within same transaction
@@ -606,17 +583,17 @@ void InitialSyncerTest::processSuccessfulLastOplogEntryFetcherResponse(std::vect
 }
 
 void assertFCVRequest(RemoteCommandRequest request) {
-    ASSERT_EQUALS(nsToDatabaseSubstring(FeatureCompatibilityVersion::kCollection), request.dbname)
+    ASSERT_EQUALS(NamespaceString::kServerConfigurationNamespace.db(), request.dbname)
         << request.toString();
-    ASSERT_EQUALS(nsToCollectionSubstring(FeatureCompatibilityVersion::kCollection),
+    ASSERT_EQUALS(NamespaceString::kServerConfigurationNamespace.coll(),
                   request.cmdObj.getStringField("find"));
-    ASSERT_BSONOBJ_EQ(BSON("_id" << FeatureCompatibilityVersion::kParameterName),
+    ASSERT_BSONOBJ_EQ(BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
                       request.cmdObj.getObjectField("filter"));
 }
 
 void InitialSyncerTest::processSuccessfulFCVFetcherResponse36() {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersion::kParameterName << "version"
-                            << FeatureCompatibilityVersionCommandParser::kVersion36)};
+    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
+                            << FeatureCompatibilityVersionParser::kVersion36)};
     processSuccessfulFCVFetcherResponse(docs);
 }
 
@@ -624,8 +601,8 @@ void InitialSyncerTest::processSuccessfulFCVFetcherResponse(std::vector<BSONObj>
     auto net = getNet();
     auto request = assertRemoteCommandNameEquals(
         "find",
-        net->scheduleSuccessfulResponse(makeCursorResponse(
-            0LL, NamespaceString(FeatureCompatibilityVersion::kCollection), docs)));
+        net->scheduleSuccessfulResponse(
+            makeCursorResponse(0LL, NamespaceString::kServerConfigurationNamespace, docs)));
     assertFCVRequest(request);
     net->runReadyNetworkOperations();
 }
@@ -636,7 +613,6 @@ TEST_F(InitialSyncerTest, InvalidConstruction) {
     options.setMyLastOptime = [](const OpTime&,
                                  ReplicationCoordinator::DataConsistency consistency) {};
     options.resetOptimes = []() {};
-    options.getSlaveDelay = []() { return Seconds(0); };
     options.syncSourceSelector = this;
     auto callback = [](const StatusWith<OpTimeWithHash>&) {};
 
@@ -645,6 +621,7 @@ TEST_F(InitialSyncerTest, InvalidConstruction) {
         auto dataReplicatorExternalState = stdx::make_unique<DataReplicatorExternalStateMock>();
         ASSERT_THROWS_CODE_AND_WHAT(InitialSyncer(options,
                                                   std::move(dataReplicatorExternalState),
+                                                  _dbWorkThreadPool.get(),
                                                   _storageInterface.get(),
                                                   _replicationProcess.get(),
                                                   callback),
@@ -659,6 +636,7 @@ TEST_F(InitialSyncerTest, InvalidConstruction) {
         dataReplicatorExternalState->taskExecutor = &getExecutor();
         ASSERT_THROWS_CODE_AND_WHAT(InitialSyncer(options,
                                                   std::move(dataReplicatorExternalState),
+                                                  _dbWorkThreadPool.get(),
                                                   _storageInterface.get(),
                                                   _replicationProcess.get(),
                                                   InitialSyncer::OnCompletionFn()),
@@ -996,6 +974,7 @@ TEST_F(InitialSyncerTest, InitialSyncerResetsOnCompletionCallbackFunctionPointer
     auto initialSyncer = stdx::make_unique<InitialSyncer>(
         _options,
         std::move(dataReplicatorExternalState),
+        _dbWorkThreadPool.get(),
         _storageInterface.get(),
         _replicationProcess.get(),
         [&lastApplied, sharedCallbackData](const StatusWith<OpTimeWithHash>& result) {
@@ -1385,7 +1364,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughFCVFetcherScheduleError) {
         [&request](const executor::RemoteCommandRequest& requestToSend) {
             request = requestToSend;
             return "find" == requestToSend.cmdObj.firstElement().fieldNameStringData() &&
-                nsToCollectionSubstring(FeatureCompatibilityVersion::kCollection) ==
+                NamespaceString::kServerConfigurationNamespace.coll() ==
                 requestToSend.cmdObj.firstElement().str();
         };
 
@@ -1532,8 +1511,8 @@ TEST_F(InitialSyncerTest,
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsTooManyMatchingDocumentsWhenFCVFetcherReturnsMultipleDocuments) {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersion::kParameterName << "version"
-                            << FeatureCompatibilityVersionCommandParser::kVersion36),
+    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
+                            << FeatureCompatibilityVersionParser::kVersion36),
                  BSON("_id"
                       << "other")};
     runInitialSyncWithBadFCVResponse(docs, ErrorCodes::TooManyMatchingDocuments);
@@ -1541,25 +1520,25 @@ TEST_F(InitialSyncerTest,
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsIncompatibleServerVersionWhenFCVFetcherReturnsUpgradeTargetVersion) {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersion::kParameterName << "version"
-                            << FeatureCompatibilityVersionCommandParser::kVersion36
+    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
+                            << FeatureCompatibilityVersionParser::kVersion36
                             << "targetVersion"
-                            << FeatureCompatibilityVersionCommandParser::kVersion40)};
+                            << FeatureCompatibilityVersionParser::kVersion40)};
     runInitialSyncWithBadFCVResponse(docs, ErrorCodes::IncompatibleServerVersion);
 }
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsIncompatibleServerVersionWhenFCVFetcherReturnsDowngradeTargetVersion) {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersion::kParameterName << "version"
-                            << FeatureCompatibilityVersionCommandParser::kVersion36
+    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
+                            << FeatureCompatibilityVersionParser::kVersion36
                             << "targetVersion"
-                            << FeatureCompatibilityVersionCommandParser::kVersion36)};
+                            << FeatureCompatibilityVersionParser::kVersion36)};
     runInitialSyncWithBadFCVResponse(docs, ErrorCodes::IncompatibleServerVersion);
 }
 
 TEST_F(InitialSyncerTest, InitialSyncerReturnsBadValueWhenFCVFetcherReturnsNoVersion) {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersion::kParameterName << "targetVersion"
-                            << FeatureCompatibilityVersionCommandParser::kVersion36)};
+    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "targetVersion"
+                            << FeatureCompatibilityVersionParser::kVersion36)};
     runInitialSyncWithBadFCVResponse(docs, ErrorCodes::BadValue);
 }
 
@@ -1581,8 +1560,8 @@ TEST_F(InitialSyncerTest, InitialSyncerSucceedsWhenFCVFetcherReturnsOldVersion) 
         // Last oplog entry.
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
 
-        auto docs = {BSON("_id" << FeatureCompatibilityVersion::kParameterName << "version"
-                                << FeatureCompatibilityVersionCommandParser::kVersion36)};
+        auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
+                                << FeatureCompatibilityVersionParser::kVersion36)};
         processSuccessfulFCVFetcherResponse(docs);
         ASSERT_TRUE(net->hasReadyRequests());
     }
@@ -2431,11 +2410,12 @@ TEST_F(
     TimestampedBSONObj insertDocumentDoc;
     long long insertDocumentTerm;
     _storageInterface->insertDocumentFn =
-        [&insertDocumentDoc, &insertDocumentNss, &insertDocumentTerm](OperationContext*,
-                                                                      const NamespaceString& nss,
-                                                                      const TimestampedBSONObj& doc,
-                                                                      long long term) {
-            insertDocumentNss = nss;
+        [&insertDocumentDoc, &insertDocumentNss, &insertDocumentTerm](
+            OperationContext*,
+            const NamespaceStringOrUUID& nsOrUUID,
+            const TimestampedBSONObj& doc,
+            long long term) {
+            insertDocumentNss = *nsOrUUID.nss();
             insertDocumentDoc = doc;
             insertDocumentTerm = term;
             return Status(ErrorCodes::OperationFailed, "failed to insert oplog entry");
@@ -2497,19 +2477,18 @@ TEST_F(
     NamespaceString insertDocumentNss;
     TimestampedBSONObj insertDocumentDoc;
     long long insertDocumentTerm;
-    _storageInterface->insertDocumentFn = [initialSyncer,
-                                           &insertDocumentDoc,
-                                           &insertDocumentNss,
-                                           &insertDocumentTerm](OperationContext*,
-                                                                const NamespaceString& nss,
-                                                                const TimestampedBSONObj& doc,
-                                                                long long term) {
-        insertDocumentNss = nss;
-        insertDocumentDoc = doc;
-        insertDocumentTerm = term;
-        initialSyncer->shutdown().transitional_ignore();
-        return Status::OK();
-    };
+    _storageInterface->insertDocumentFn =
+        [initialSyncer, &insertDocumentDoc, &insertDocumentNss, &insertDocumentTerm](
+            OperationContext*,
+            const NamespaceStringOrUUID& nsOrUUID,
+            const TimestampedBSONObj& doc,
+            long long term) {
+            insertDocumentNss = *nsOrUUID.nss();
+            insertDocumentDoc = doc;
+            insertDocumentTerm = term;
+            initialSyncer->shutdown().transitional_ignore();
+            return Status::OK();
+        };
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
@@ -3319,7 +3298,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughMultiApplierCallbackError) {
     auto opCtx = makeOpCtx();
 
     getExternalState()->multiApplyFn =
-        [](OperationContext*, const MultiApplier::Operations&, MultiApplier::ApplyOperationFn) {
+        [](OperationContext*, const MultiApplier::Operations&, OplogApplier::Observer*) {
             return Status(ErrorCodes::OperationFailed, "multiApply failed");
         };
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
@@ -3420,7 +3399,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsGetNextApplierBatchCallbackOnOplog
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
 }
 
-OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
+OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch(bool shouldSetFCV) {
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -3467,7 +3446,12 @@ OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
         assertRemoteCommandNameEquals("getMore", request);
         net->blackHole(noi);
 
-        // Last rollback ID.
+        // Last rollback ID check. Before this check, set fCV to 4.2 if required by the test.
+        // TODO(SERVER-34489) Update below statement to setFCV=4.2 when upgrade/downgrade is ready.
+        if (shouldSetFCV) {
+            createTimestampSafeUniqueIndex = true;
+        }
+
         request = net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(baseRollbackId));
         assertRemoteCommandNameEquals("replSetGetRBID", request);
         net->runReadyNetworkOperations();
@@ -3483,8 +3467,10 @@ OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
     return lastOp;
 }
 
-void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch() {
-    auto lastOp = doInitialSyncWithOneBatch();
+void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch(bool shouldSetFCV) {
+    auto lastOp = doInitialSyncWithOneBatch(shouldSetFCV);
+    // TODO(SERVER-34489) Replace this by fCV reset when upgrade/downgrade is ready.
+    createTimestampSafeUniqueIndex = false;
     ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied).opTime);
     ASSERT_EQUALS(lastOp.getHash(), unittest::assertGet(_lastApplied).value);
 
@@ -3493,13 +3479,14 @@ void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch() {
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsLastAppliedOnReachingStopTimestampAfterApplyingOneBatch) {
-    // In this test, getCollectionUUID should not return a UUID. Hence,
-    // upgradeUUIDSchemaVersionNonReplicated should not be called.
-    doSuccessfulInitialSyncWithOneBatch();
+    // Tell test to setFCV=4.2 before the last rollback ID check.
+    // _rollbackCheckerCheckForRollbackCallback() calls upgradeNonReplicatedUniqueIndexes
+    // only if fCV is 4.2.
+    doSuccessfulInitialSyncWithOneBatch(true);
 
-    // Ensure upgradeUUIDSchemaVersionNonReplicated was not called.
+    // Ensure that upgradeNonReplicatedUniqueIndexes is called.
     LockGuard lock(_storageInterfaceWorkDoneMutex);
-    ASSERT_FALSE(_storageInterfaceWorkDone.schemaUpgraded);
+    ASSERT_TRUE(_storageInterfaceWorkDone.uniqueIndexUpdated);
 }
 
 TEST_F(InitialSyncerTest,
@@ -3615,25 +3602,17 @@ TEST_F(
     // missing document.
     // This forces InitialSyncer to evaluate its end timestamp for applying operations after each
     // batch.
-    getExternalState()->multiApplyFn = [](OperationContext*,
-                                          const MultiApplier::Operations& ops,
-                                          MultiApplier::ApplyOperationFn applyOperation) {
-        // 'OperationPtr*' is ignored by our overridden _multiInitialSyncApply().
-        ASSERT_OK(applyOperation(nullptr, nullptr));
+    bool fetchCountIncremented = false;
+    getExternalState()->multiApplyFn = [&fetchCountIncremented](OperationContext* opCtx,
+                                                                const MultiApplier::Operations& ops,
+                                                                OplogApplier::Observer* observer) {
+        if (!fetchCountIncremented) {
+            auto entry = makeOplogEntry(1);
+            observer->onMissingDocumentsFetchedAndInserted({std::make_pair(entry, BSONObj())});
+            fetchCountIncremented = true;
+        }
         return ops.back().getOpTime();
     };
-    bool fetchCountIncremented = false;
-    getExternalState()->multiInitialSyncApplyFn =
-        [&fetchCountIncremented](MultiApplier::OperationPtrs*,
-                                 const HostAndPort&,
-                                 AtomicUInt32* fetchCount,
-                                 WorkerMultikeyPathInfo*) {
-            if (!fetchCountIncremented) {
-                fetchCount->addAndFetch(1);
-                fetchCountIncremented = true;
-            }
-            return Status::OK();
-        };
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
@@ -4040,53 +4019,93 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
         << attempt1;
 }
 
-TEST_F(InitialSyncerTest, InitialSyncerUpdatesCollectionUUIDsIfgetCollectionUUIDReturnsUUID) {
-    // Ensure getCollectionUUID returns a UUID. This should trigger a call to
-    // upgradeUUIDSchemaVersionNonReplicated.
-    {
-        LockGuard lock(_storageInterfaceWorkDoneMutex);
-        _storageInterfaceWorkDone.uuid = UUID::gen();
-    }
-    doSuccessfulInitialSyncWithOneBatch();
+TEST_F(InitialSyncerTest, GetInitialSyncProgressOmitsClonerStatsIfClonerStatsExceedBsonLimit) {
+    auto initialSyncer = &getInitialSyncer();
+    auto opCtx = makeOpCtx();
 
-    // Ensure upgradeUUIDSchemaVersionNonReplicated was called.
+    _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 27017));
+    ASSERT_OK(initialSyncer->startup(opCtx.get(), 2U));
+
+    const std::size_t numCollections = 200000U;
+
+    auto net = getNet();
+    int baseRollbackId = 1;
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+
+        // Base rollback ID.
+        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(baseRollbackId));
+        net->runReadyNetworkOperations();
+
+        // Last oplog entry.
+        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
+
+        // Feature Compatibility Version.
+        processSuccessfulFCVFetcherResponse36();
+
+        // listDatabases
+        NamespaceString nss("a.a");
+        auto request =
+            net->scheduleSuccessfulResponse(makeListDatabasesResponse({nss.db().toString()}));
+        assertRemoteCommandNameEquals("listDatabases", request);
+        net->runReadyNetworkOperations();
+
+        // Ignore oplog tailing query.
+        request = net->scheduleSuccessfulResponse(
+            makeCursorResponse(1LL, _options.localOplogNS, {makeOplogEntryObj(1)}));
+        assertRemoteCommandNameEquals("find", request);
+        ASSERT_TRUE(request.cmdObj.getBoolField("oplogReplay"));
+        net->runReadyNetworkOperations();
+
+        // listCollections for "a"
+        std::vector<BSONObj> collectionInfos;
+        for (std::size_t i = 0; i < numCollections; ++i) {
+            const std::string collName = str::stream() << "coll-" << i;
+            collectionInfos.push_back(BSON("name" << collName << "options" << BSONObj()));
+        }
+        request = net->scheduleSuccessfulResponse(
+            makeCursorResponse(0LL, nss.getCommandNS(), collectionInfos));
+        assertRemoteCommandNameEquals("listCollections", request);
+        net->runReadyNetworkOperations();
+    }
+
+    // This returns a valid document because we omit the cloner stats when they do not fit in a
+    // BSON document.
+    auto progress = initialSyncer->getInitialSyncProgress();
+    ASSERT_EQUALS(progress["initialSyncStart"].type(), Date) << progress;
+    ASSERT_FALSE(progress.hasField("databases")) << progress;
+
+    // Initial sync will attempt to log stats again at shutdown in a callback, where it should not
+    // terminate because we now return a valid stats document.
+    ASSERT_OK(initialSyncer->shutdown());
+
+    // Deliver cancellation signal to callbacks.
+    executor::NetworkInterfaceMock::InNetworkGuard(net)->runReadyNetworkOperations();
+
+    initialSyncer->join();
+}
+
+TEST_F(InitialSyncerTest, InitialSyncerDoesNotCallUpgradeNonReplicatedUniqueIndexesOnFCV40) {
+    // In MongoDB 4.2, upgradeNonReplicatedUniqueIndexes will only be called if fCV is 4.2.
+    doSuccessfulInitialSyncWithOneBatch(false);
+
+    // TODO(SERVER-34489) Ensure that upgradeNonReplicatedUniqueIndexes is not called if fCV
+    // is not 4.2.
     LockGuard lock(_storageInterfaceWorkDoneMutex);
-    ASSERT_TRUE(_storageInterfaceWorkDone.schemaUpgraded);
+    ASSERT_FALSE(_storageInterfaceWorkDone.uniqueIndexUpdated);
 }
 
-TEST_F(InitialSyncerTest, InitialSyncerCapturesGetCollectionUUIDError) {
-    // Ensure getCollectionUUID returns a bad status. This should be passed to the initial syncer.
+TEST_F(InitialSyncerTest, InitialSyncerUpgradeNonReplicatedUniqueIndexesError) {
+    // Ensure upgradeNonReplicatedUniqueIndexes returns a bad status. This should be passed to the
+    // initial syncer.
     {
         LockGuard lock(_storageInterfaceWorkDoneMutex);
-        _storageInterfaceWorkDone.getCollectionUUIDShouldFail = true;
+        _storageInterfaceWorkDone.upgradeNonReplicatedUniqueIndexesShouldFail = true;
     }
-    doInitialSyncWithOneBatch();
+    doInitialSyncWithOneBatch(true);
 
-    // Ensure the getCollectionUUID status was captured.
-    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, _lastApplied);
-
-    // Ensure upgradeUUIDSchemaVersionNonReplicated was not called.
-    LockGuard lock(_storageInterfaceWorkDoneMutex);
-    ASSERT_FALSE(_storageInterfaceWorkDone.schemaUpgraded);
-}
-
-TEST_F(InitialSyncerTest, InitialSyncerCapturesUpgradeUUIDSchemaVersionError) {
-    // Ensure getCollectionUUID returns a UUID. This should trigger a call to
-    // upgradeUUIDSchemaVersionNonReplicated.
-    {
-        LockGuard lock(_storageInterfaceWorkDoneMutex);
-        _storageInterfaceWorkDone.uuid = UUID::gen();
-    }
-
-    // Ensure upgradeUUIDSchemaVersionNonReplicated returns a bad status. This should be passed to
-    // the initial syncer.
-    {
-        LockGuard lock(_storageInterfaceWorkDoneMutex);
-        _storageInterfaceWorkDone.upgradeUUIDSchemaVersionNonReplicatedShouldFail = true;
-    }
-    doInitialSyncWithOneBatch();
-
-    // Ensure the upgradeUUIDSchemaVersionNonReplicated status was captured.
+    // Ensure the upgradeNonReplicatedUniqueIndexes status was captured.
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, _lastApplied);
 }
+
 }  // namespace

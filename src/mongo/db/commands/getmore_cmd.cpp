@@ -40,6 +40,7 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -50,7 +51,7 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
@@ -67,35 +68,64 @@ namespace {
 
 MONGO_FP_DECLARE(rsStopGetMoreCmd);
 
-// Helper function which sets the 'msg' field of the opCtx's CurOp to the specified string, and
-// returns the original value of the field.
-std::string updateCurOpMsg(OperationContext* opCtx, const std::string& newMsg) {
-    stdx::lock_guard<Client> lk(*opCtx->getClient());
-    auto oldMsg = CurOp::get(opCtx)->getMessage();
-    CurOp::get(opCtx)->setMessage_inlock(newMsg.c_str());
-    return oldMsg;
+MONGO_FP_DECLARE(waitWithPinnedCursorDuringGetMoreBatch);
+
+/**
+ * Validates that the lsid of 'opCtx' matches that of 'cursor'. This must be called after
+ * authenticating, so that it is safe to report the lsid of 'cursor'.
+ */
+void validateLSID(OperationContext* opCtx, const GetMoreRequest& request, ClientCursor* cursor) {
+    uassert(50736,
+            str::stream() << "Cannot run getMore on cursor " << request.cursorid
+                          << ", which was not created in a session, in session "
+                          << *opCtx->getLogicalSessionId(),
+            !opCtx->getLogicalSessionId() || cursor->getSessionId());
+
+    uassert(50737,
+            str::stream() << "Cannot run getMore on cursor " << request.cursorid
+                          << ", which was created in session "
+                          << *cursor->getSessionId()
+                          << ", without an lsid",
+            opCtx->getLogicalSessionId() || !cursor->getSessionId());
+
+    uassert(50738,
+            str::stream() << "Cannot run getMore on cursor " << request.cursorid
+                          << ", which was created in session "
+                          << *cursor->getSessionId()
+                          << ", in session "
+                          << *opCtx->getLogicalSessionId(),
+            !opCtx->getLogicalSessionId() || !cursor->getSessionId() ||
+                (*opCtx->getLogicalSessionId() == *cursor->getSessionId()));
 }
 
-// This helper function works much like MONGO_FAIL_POINT_PAUSE_WHILE_SET, but it additionally
-// releases and re-acquires the collection readLock at regular intervals, in order to avoid
-// deadlocks caused by the pinned-cursor failpoints in this file (see SERVER-21997). Finally, it
-// also sets the 'msg' field of the opCtx's CurOp to the given string while the failpoint is active.
-void waitWhileFailPointEnabled(FailPoint* failPoint,
-                               OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               const std::string& curOpMsg,
-                               boost::optional<AutoGetCollectionForRead>* readLock) {
-    invariant(failPoint);
-    auto origCurOpMsg = updateCurOpMsg(opCtx, curOpMsg);
+/**
+ * Validates that the txnNumber of 'opCtx' matches that of 'cursor'. This must be called after
+ * authenticating, so that it is safe to report the txnNumber of 'cursor'.
+ */
+void validateTxnNumber(OperationContext* opCtx,
+                       const GetMoreRequest& request,
+                       ClientCursor* cursor) {
+    uassert(50739,
+            str::stream() << "Cannot run getMore on cursor " << request.cursorid
+                          << ", which was not created in a transaction, in transaction "
+                          << *opCtx->getTxnNumber(),
+            !opCtx->getTxnNumber() || cursor->getTxnNumber());
 
-    while (MONGO_FAIL_POINT((*failPoint))) {
-        sleepFor(Milliseconds(10));
-        if (readLock && *readLock) {
-            readLock->reset();
-            readLock->emplace(opCtx, nss);
-        }
-    }
-    updateCurOpMsg(opCtx, origCurOpMsg);
+    uassert(50740,
+            str::stream() << "Cannot run getMore on cursor " << request.cursorid
+                          << ", which was created in transaction "
+                          << *cursor->getTxnNumber()
+                          << ", without a txnNumber",
+            opCtx->getTxnNumber() || !cursor->getTxnNumber());
+
+    uassert(50741,
+            str::stream() << "Cannot run getMore on cursor " << request.cursorid
+                          << ", which was created in transaction "
+                          << *cursor->getTxnNumber()
+                          << ", in transaction "
+                          << *opCtx->getTxnNumber(),
+            !opCtx->getTxnNumber() || !cursor->getTxnNumber() ||
+                (*opCtx->getTxnNumber() == *cursor->getTxnNumber()));
 }
 
 /**
@@ -187,7 +217,6 @@ public:
                    const GetMoreRequest& request,
                    const BSONObj& cmdObj,
                    BSONObjBuilder& result) {
-
         auto curOp = CurOp::get(opCtx);
         curOp->debug().cursorid = request.cursorid;
 
@@ -196,9 +225,7 @@ public:
             auto replCoord = repl::ReplicationCoordinator::get(opCtx);
             Status status = replCoord->updateTerm(opCtx, *request.term);
             // Note: updateTerm returns ok if term stayed the same.
-            if (!status.isOK()) {
-                return CommandHelpers::appendCommandStatus(result, status);
-            }
+            uassertStatusOK(status);
         }
 
         // Cursors come in one of two flavors:
@@ -244,30 +271,36 @@ public:
 
             Collection* collection = readLock->getCollection();
             if (!collection) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    Status(ErrorCodes::OperationFailed,
-                           "collection dropped between getMore calls"));
+                uasserted(ErrorCodes::OperationFailed, "collection dropped between getMore calls");
             }
             cursorManager = collection->getCursorManager();
         }
 
         auto ccPin = cursorManager->pinCursor(opCtx, request.cursorid);
-        if (!ccPin.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, ccPin.getStatus());
-        }
+        uassertStatusOK(ccPin.getStatus());
 
         ClientCursor* cursor = ccPin.getValue().getCursor();
 
+        // Only used by the failpoints.
+        const auto dropAndReaquireReadLock = [&readLock, opCtx, &request]() {
+            // Make sure an interrupted operation does not prevent us from reacquiring the lock.
+            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+            readLock.reset();
+            readLock.emplace(opCtx, request.nss);
+        };
+
         // If the 'waitAfterPinningCursorBeforeGetMoreBatch' fail point is enabled, set the 'msg'
-        // field of this operation's CurOp to signal that we've hit this point and then spin until
-        // the failpoint is released.
+        // field of this operation's CurOp to signal that we've hit this point and then repeatedly
+        // release and re-acquire the collection readLock at regular intervals until the failpoint
+        // is released. This is done in order to avoid deadlocks caused by the pinned-cursor
+        // failpoints in this file (see SERVER-21997).
         if (MONGO_FAIL_POINT(waitAfterPinningCursorBeforeGetMoreBatch)) {
-            waitWhileFailPointEnabled(&waitAfterPinningCursorBeforeGetMoreBatch,
-                                      opCtx,
-                                      request.nss,
-                                      "waitAfterPinningCursorBeforeGetMoreBatch",
-                                      &readLock);
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &waitAfterPinningCursorBeforeGetMoreBatch,
+                opCtx,
+                "waitAfterPinningCursorBeforeGetMoreBatch",
+                dropAndReaquireReadLock);
         }
 
         // A user can only call getMore on their own cursor. If there were multiple users
@@ -275,28 +308,26 @@ public:
         // authenticated in order to run getMore on the cursor.
         if (!AuthorizationSession::get(opCtx->getClient())
                  ->isCoauthorizedWith(cursor->getAuthenticatedUsers())) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::Unauthorized,
-                       str::stream() << "cursor id " << request.cursorid
-                                     << " was not created by the authenticated user"));
+            uasserted(ErrorCodes::Unauthorized,
+                      str::stream() << "cursor id " << request.cursorid
+                                    << " was not created by the authenticated user");
         }
 
         if (request.nss != cursor->nss()) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::Unauthorized,
-                       str::stream() << "Requested getMore on namespace '" << request.nss.ns()
-                                     << "', but cursor belongs to a different namespace "
-                                     << cursor->nss().ns()));
+            uasserted(ErrorCodes::Unauthorized,
+                      str::stream() << "Requested getMore on namespace '" << request.nss.ns()
+                                    << "', but cursor belongs to a different namespace "
+                                    << cursor->nss().ns());
         }
 
+        // Ensure the lsid and txnNumber of the getMore match that of the originating command.
+        validateLSID(opCtx, request, cursor);
+        validateTxnNumber(opCtx, request, cursor);
+
         if (request.nss.isOplog() && MONGO_FAIL_POINT(rsStopGetMoreCmd)) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::CommandFailed,
-                       str::stream() << "getMore on " << request.nss.ns()
-                                     << " rejected due to active fail point rsStopGetMoreCmd"));
+            uasserted(ErrorCodes::CommandFailed,
+                      str::stream() << "getMore on " << request.nss.ns()
+                                    << " rejected due to active fail point rsStopGetMoreCmd");
         }
 
         // Validation related to awaitData.
@@ -307,14 +338,19 @@ public:
         if (request.awaitDataTimeout && !cursor->isAwaitData()) {
             Status status(ErrorCodes::BadValue,
                           "cannot set maxTimeMS on getMore command for a non-awaitData cursor");
-            return CommandHelpers::appendCommandStatus(result, status);
+            uassertStatusOK(status);
         }
 
         // On early return, get rid of the cursor.
         ScopeGuard cursorFreer = MakeGuard(&ClientCursorPin::deleteUnderlying, &ccPin.getValue());
 
-        if (cursor->isReadCommitted())
-            uassertStatusOK(opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+        const auto replicationMode = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode();
+        if (replicationMode == repl::ReplicationCoordinator::modeReplSet &&
+            cursor->getReadConcernLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
+            opCtx->recoveryUnit()->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kMajorityCommitted);
+            uassertStatusOK(opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot());
+        }
 
         const bool disableAwaitDataFailpointActive =
             MONGO_FAIL_POINT(disableAwaitDataForGetMoreCmd);
@@ -327,7 +363,6 @@ public:
             // any leftover time from the maxTimeMS of the operation that spawned this cursor,
             // applying it to this getMore.
             if (cursor->isAwaitData() && !disableAwaitDataFailpointActive) {
-                opCtx->clearDeadline();
                 awaitDataState(opCtx).waitForInsertsDeadline =
                     opCtx->getServiceContext()->getPreciseClockSource()->now() +
                     request.awaitDataTimeout.value_or(Seconds{1});
@@ -380,17 +415,15 @@ public:
         // operation's CurOp to signal that we've hit this point and then spin until the failpoint
         // is released.
         if (MONGO_FAIL_POINT(waitWithPinnedCursorDuringGetMoreBatch)) {
-            waitWhileFailPointEnabled(&waitWithPinnedCursorDuringGetMoreBatch,
-                                      opCtx,
-                                      request.nss,
-                                      "waitWithPinnedCursorDuringGetMoreBatch",
-                                      &readLock);
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &waitWithPinnedCursorDuringGetMoreBatch,
+                opCtx,
+                "waitWithPinnedCursorDuringGetMoreBatch",
+                dropAndReaquireReadLock);
         }
 
         Status batchStatus = generateBatch(opCtx, cursor, request, &nextBatch, &state, &numResults);
-        if (!batchStatus.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, batchStatus);
-        }
+        uassertStatusOK(batchStatus);
 
         PlanSummaryStats postExecutionStats;
         Explain::getSummaryStats(*exec, &postExecutionStats);
@@ -416,8 +449,6 @@ public:
 
             cursor->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
             cursor->incPos(numResults);
-
-            opCtx->setStashedCursor();
         } else {
             curOp->debug().cursorExhausted = true;
         }
@@ -437,11 +468,11 @@ public:
         // failpoint is active, set the 'msg' field of this operation's CurOp to signal that we've
         // hit this point and then spin until the failpoint is released.
         if (MONGO_FAIL_POINT(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch)) {
-            waitWhileFailPointEnabled(&waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch,
-                                      opCtx,
-                                      request.nss,
-                                      "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch",
-                                      &readLock);
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch,
+                opCtx,
+                "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch",
+                dropAndReaquireReadLock);
         }
 
         return true;
@@ -455,9 +486,7 @@ public:
         globalOpCounters.gotGetMore();
 
         StatusWith<GetMoreRequest> parsedRequest = GetMoreRequest::parseFromBSON(dbname, cmdObj);
-        if (!parsedRequest.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, parsedRequest.getStatus());
-        }
+        uassertStatusOK(parsedRequest.getStatus());
         auto request = parsedRequest.getValue();
         return runParsed(opCtx, request.nss, request, cmdObj, result);
     }

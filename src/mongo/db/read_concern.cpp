@@ -47,6 +47,7 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
@@ -207,9 +208,17 @@ Status waitForReadConcern(OperationContext* opCtx,
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     invariant(replCoord);
 
+    auto session = OperationContextSession::get(opCtx);
+    // Currently speculative read concern is used only for transactions and snapshot reads. However,
+    // speculative read concern is not yet supported with atClusterTime.
+    //
+    // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
+    const bool speculative = session && session->inSnapshotReadOrMultiDocumentTransaction() &&
+        !readConcernArgs.getArgsAtClusterTime();
+
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
         if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
-            // For master/slave and standalone nodes, Linearizable Read is not supported.
+            // For standalone nodes, Linearizable Read is not supported.
             return {ErrorCodes::NotAReplicaSet,
                     "node needs to be a replica set member to use read concern"};
         }
@@ -243,6 +252,9 @@ Status waitForReadConcern(OperationContext* opCtx,
             return {ErrorCodes::IncompatibleElectionProtocol,
                     "Replica sets running protocol version 0 do not support readConcern: snapshot"};
         }
+        if (speculative) {
+            session->setSpeculativeTransactionOpTimeToLastApplied(opCtx);
+        }
     }
 
     auto afterClusterTime = readConcernArgs.getArgsAfterClusterTime();
@@ -252,18 +264,32 @@ Status waitForReadConcern(OperationContext* opCtx,
         if (!allowAfterClusterTime) {
             return {ErrorCodes::InvalidOptions, "afterClusterTime is not allowed for this command"};
         }
-
-        auto currentTime = LogicalClock::get(opCtx)->getClusterTime();
-        if (currentTime < *afterClusterTime) {
-            return {ErrorCodes::InvalidOptions,
-                    "readConcern afterClusterTime must not be greater than clusterTime value"};
-        }
     }
 
     if (!readConcernArgs.isEmpty()) {
         invariant(!afterClusterTime || !atClusterTime);
         auto targetClusterTime = afterClusterTime ? afterClusterTime : atClusterTime;
-        if (replCoord->isReplEnabled() && targetClusterTime) {
+
+        if (targetClusterTime) {
+            std::string readConcernName = afterClusterTime ? "afterClusterTime" : "atClusterTime";
+
+            if (!replCoord->isReplEnabled()) {
+                return {ErrorCodes::IllegalOperation,
+                        str::stream() << "Cannot specify " << readConcernName
+                                      << " readConcern without replication enabled"};
+            }
+
+            auto currentTime = LogicalClock::get(opCtx)->getClusterTime();
+            if (currentTime < *targetClusterTime) {
+                return {ErrorCodes::InvalidOptions,
+                        str::stream() << "readConcern " << readConcernName
+                                      << " value must not be greater than the current clusterTime. "
+                                         "Requested clusterTime: "
+                                      << targetClusterTime->toString()
+                                      << "; current clusterTime: "
+                                      << currentTime.toString()};
+            }
+
             auto status = makeNoopWriteIfNeeded(opCtx, *targetClusterTime);
             if (!status.isOK()) {
                 LOG(0) << "Failed noop write at clusterTime: " << targetClusterTime->toString()
@@ -281,12 +307,16 @@ Status waitForReadConcern(OperationContext* opCtx,
 
 
     if (atClusterTime) {
-        fassertStatusOK(39345, opCtx->recoveryUnit()->selectSnapshot(atClusterTime->asTimestamp()));
+        // TODO(SERVER-34620): We should be using Session::setSpeculativeTransactionReadOpTime when
+        // doing speculative execution with atClusterTime.
+        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
+                                                      atClusterTime->asTimestamp());
         return Status::OK();
     }
 
     if ((readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern ||
          readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) &&
+        !speculative &&
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet) {
         if (!replCoord->isV1ElectionProtocol()) {
             return {ErrorCodes::IncompatibleElectionProtocol,
@@ -299,13 +329,14 @@ Status waitForReadConcern(OperationContext* opCtx,
         LOG(debugLevel) << "Waiting for 'committed' snapshot to be available for reading: "
                         << readConcernArgs;
 
-        Status status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
+        Status status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
 
         // Wait until a snapshot is available.
         while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
             LOG(debugLevel) << "Snapshot not available yet.";
             replCoord->waitUntilSnapshotCommitted(opCtx, Timestamp());
-            status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+            status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
         }
 
         if (!status.isOK()) {
@@ -313,6 +344,10 @@ Status waitForReadConcern(OperationContext* opCtx,
         }
 
         LOG(debugLevel) << "Using 'committed' snapshot: " << CurOp::get(opCtx)->opDescription();
+    }
+
+    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kAvailableReadConcern) {
+        opCtx->recoveryUnit()->setIgnorePrepared(true);
     }
 
     return Status::OK();

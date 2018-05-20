@@ -1,23 +1,25 @@
-"""
-Parser for command line arguments.
-"""
+"""Parser for command line arguments."""
 
 from __future__ import absolute_import
 
+import collections
 import os
 import os.path
+
+import datetime
 import optparse
 
 from . import config as _config
 from . import utils
 from .. import resmokeconfig
 
+ResmokeConfig = collections.namedtuple(
+    "ResmokeConfig",
+    ["list_suites", "find_suites", "dry_run", "suite_files", "test_files", "logging_config"])
 
-def parse_command_line():
-    """
-    Parses the command line arguments passed to resmoke.py.
-    """
 
+def _make_parser():  # pylint: disable=too-many-statements
+    """Create and return the command line arguments parser."""
     parser = optparse.OptionParser()
 
     parser.add_option("--suites", dest="suite_files", metavar="SUITE1,SUITE2",
@@ -126,34 +128,36 @@ def parse_command_line():
                       help="Disables preallocation of journal files for all mongod processes.")
 
     parser.add_option("--numClientsPerFixture", type="int", dest="num_clients_per_fixture",
-                      help="Number of clients running tests per fixture")
+                      help="Number of clients running tests per fixture.")
+
+    parser.add_option("--perfReportFile", dest="perf_report_file", metavar="PERF_REPORT",
+                      help="Writes a JSON file with performance test results.")
 
     parser.add_option("--preallocJournal", type="choice", action="store", dest="prealloc_journal",
                       choices=("on", "off"), metavar="ON|OFF",
                       help=("Enables or disables preallocation of journal files for all mongod"
                             " processes. Defaults to %default."))
 
-    parser.add_option("--shellConnString", dest="shell_conn_string",
-                      metavar="CONN_STRING",
+    parser.add_option("--shellConnString", dest="shell_conn_string", metavar="CONN_STRING",
                       help="Overrides the default fixture and connect to an existing MongoDB"
-                           " cluster instead. This is useful for connecting to a MongoDB"
-                           " deployment started outside of resmoke.py including one running in a"
-                           " debugger.")
+                      " cluster instead. This is useful for connecting to a MongoDB"
+                      " deployment started outside of resmoke.py including one running in a"
+                      " debugger.")
 
     parser.add_option("--shellPort", dest="shell_port", metavar="PORT",
                       help="Convenience form of --shellConnString for connecting to an"
-                           " existing MongoDB cluster with the URL mongodb://localhost:[PORT]."
-                           " This is useful for connecting to a server running in a debugger.")
+                      " existing MongoDB cluster with the URL mongodb://localhost:[PORT]."
+                      " This is useful for connecting to a server running in a debugger.")
 
     parser.add_option("--repeat", type="int", dest="repeat", metavar="N",
                       help="Repeats the given suite(s) N times, or until one fails.")
 
     parser.add_option("--reportFailureStatus", type="choice", action="store",
-                      dest="report_failure_status", choices=("fail", "silentfail"),
-                      metavar="STATUS",
+                      dest="report_failure_status", choices=("fail",
+                                                             "silentfail"), metavar="STATUS",
                       help="Controls if the test failure status should be reported as failed"
-                           " or be silently ignored (STATUS=silentfail). Dynamic test failures will"
-                           " never be silently ignored. Defaults to STATUS=%default.")
+                      " or be silently ignored (STATUS=silentfail). Dynamic test failures will"
+                      " never be silently ignored. Defaults to STATUS=%default.")
 
     parser.add_option("--reportFile", dest="report_file", metavar="REPORT",
                       help="Writes a JSON file with test status and timing information.")
@@ -212,14 +216,16 @@ def parse_command_line():
 
     parser.add_option("--executor", dest="executor_file",
                       help="OBSOLETE: Superceded by --suites; specify --suites=SUITE path/to/test"
-                           " to run a particular test under a particular suite configuration.")
+                      " to run a particular test under a particular suite configuration.")
 
     evergreen_options = optparse.OptionGroup(
-        parser,
-        title="Evergreen options",
+        parser, title="Evergreen options",
         description=("Options used to propagate information about the Evergreen task running this"
                      " script."))
     parser.add_option_group(evergreen_options)
+
+    evergreen_options.add_option("--buildId", dest="build_id", metavar="BUILD_ID",
+                                 help="Sets the build ID of the task.")
 
     evergreen_options.add_option("--distroId", dest="distro_id", metavar="DISTRO_ID",
                                  help=("Sets the identifier for the Evergreen distro running the"
@@ -239,8 +245,11 @@ def parse_command_line():
                                        " patch build."))
 
     evergreen_options.add_option("--projectName", dest="project_name", metavar="PROJECT_NAME",
-                                 help=("Sets the name of the Evergreen project running the tests."
-                                       ))
+                                 help=("Sets the name of the Evergreen project running the tests."))
+
+    evergreen_options.add_option("--revisionOrderId", dest="revision_order_id",
+                                 metavar="REVISION_ORDER_ID",
+                                 help="Sets the chronological order number of this commit.")
 
     evergreen_options.add_option("--taskName", dest="task_name", metavar="TASK_NAME",
                                  help="Sets the name of the Evergreen task running the tests.")
@@ -252,41 +261,89 @@ def parse_command_line():
                                  help=("Sets the name of the Evergreen build variant running the"
                                        " tests."))
 
-    parser.set_defaults(logger_file="console",
-                        dry_run="off",
-                        find_suites=False,
-                        list_suites=False,
-                        suite_files="with_server",
-                        prealloc_journal="off",
-                        shuffle="auto",
-                        stagger_jobs="off")
+    evergreen_options.add_option("--versionId", dest="version_id", metavar="VERSION_ID",
+                                 help="Sets the version ID of the task.")
 
+    benchmark_options = optparse.OptionGroup(parser, title="Benchmark test options",
+                                             description="Options for running Benchmark tests")
+
+    parser.add_option_group(benchmark_options)
+
+    benchmark_options.add_option("--benchmarkFilter", type="string", dest="benchmark_filter",
+                                 metavar="BENCHMARK_FILTER",
+                                 help="Regex to filter benchmark tests to run.")
+
+    benchmark_options.add_option("--benchmarkListTests", dest="benchmark_list_tests",
+                                 action="store_true", metavar="BENCHMARK_LIST_TESTS",
+                                 help="Lists all benchmark test configurations in each test file.")
+
+    benchmark_min_time_help = (
+        "Minimum time to run each benchmark test for. Use this option instead of "
+        "--benchmarkRepetitions to make a test run for a longer or shorter duration.")
+    benchmark_options.add_option("--benchmarkMinTimeSecs", type="int",
+                                 dest="benchmark_min_time_secs", metavar="BENCHMARK_MIN_TIME",
+                                 help=benchmark_min_time_help)
+
+    benchmark_repetitions_help = (
+        "Set --benchmarkRepetitions=1 if you'd like to run the benchmark tests only once. By "
+        "default, each test is run multiple times to provide statistics on the variance between "
+        "runs; use --benchmarkMinTimeSecs if you'd like to run a test for a longer or shorter "
+        "duration.")
+    benchmark_options.add_option("--benchmarkRepetitions", type="int", dest="benchmark_repetitions",
+                                 metavar="BENCHMARK_REPETITIONS", help=benchmark_repetitions_help)
+
+    parser.set_defaults(logger_file="console", dry_run="off", find_suites=False, list_suites=False,
+                        suite_files="with_server", prealloc_journal="off", shuffle="auto",
+                        stagger_jobs="off")
+    return parser
+
+
+def parse_command_line():
+    """Parse the command line arguments passed to resmoke.py."""
+    parser = _make_parser()
     options, args = parser.parse_args()
 
-    validate_options(parser, options, args)
+    _validate_options(parser, options, args)
+    _update_config_vars(options)
 
-    return options, args
+    return ResmokeConfig(list_suites=options.list_suites, find_suites=options.find_suites,
+                         dry_run=options.dry_run, suite_files=options.suite_files.split(","),
+                         test_files=args, logging_config=_get_logging_config(options.logger_file))
 
 
-def validate_options(parser, options, args):
-    """
-    Do preliminary validation on the options and error on any invalid options.
-    """
+def _validate_options(parser, options, args):
+    """Do preliminary validation on the options and error on any invalid options."""
 
     if options.shell_port is not None and options.shell_conn_string is not None:
         parser.error("Cannot specify both `shellPort` and `shellConnString`")
 
     if options.executor_file:
         parser.error("--executor is superseded by --suites; specify --suites={} {} to run the"
-                     " test(s) under those suite configuration(s)"
-                     .format(options.executor_file, " ".join(args)))
+                     " test(s) under those suite configuration(s)".format(
+                         options.executor_file, " ".join(args)))
 
 
-def get_logging_config(values):
-    return _get_logging_config(values.logger_file)
+def validate_benchmark_options():
+    """Error out early if any options are incompatible with benchmark test suites.
+
+    :return: None
+    """
+
+    if _config.REPEAT > 1:
+        raise optparse.OptionValueError(
+            "--repeat cannot be used with benchmark tests. Please use --benchmarkMinTimeSecs to "
+            "increase the runtime of a single benchmark configuration.")
+
+    if _config.JOBS > 1:
+        raise optparse.OptionValueError(
+            "--jobs=%d cannot be used for benchmark tests. Parallel jobs affect CPU cache access "
+            "patterns and cause additional context switching, which lead to inaccurate benchmark "
+            "results. Please use --jobs=1" % _config.JOBS)
 
 
-def update_config_vars(values):
+def _update_config_vars(values):  # pylint: disable=too-many-statements
+    """Update the variables of the config module."""
+
     config = _config.DEFAULTS.copy()
 
     # Override `config` with values from command line arguments.
@@ -306,14 +363,6 @@ def update_config_vars(values):
     _config.DBPATH_PREFIX = _expand_user(config.pop("dbpath_prefix"))
     _config.DBTEST_EXECUTABLE = _expand_user(config.pop("dbtest_executable"))
     _config.DRY_RUN = config.pop("dry_run")
-    _config.EVERGREEN_DISTRO_ID = config.pop("distro_id")
-    _config.EVERGREEN_EXECUTION = config.pop("execution_number")
-    _config.EVERGREEN_PATCH_BUILD = config.pop("patch_build")
-    _config.EVERGREEN_PROJECT_NAME = config.pop("project_name")
-    _config.EVERGREEN_REVISION = config.pop("git_revision")
-    _config.EVERGREEN_TASK_ID = config.pop("task_id")
-    _config.EVERGREEN_TASK_NAME = config.pop("task_name")
-    _config.EVERGREEN_VARIANT_NAME = config.pop("variant_name")
     _config.EXCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("exclude_with_any_tags"))
     _config.FAIL_FAST = not config.pop("continue_on_failure")
     _config.INCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("include_with_any_tags"))
@@ -326,6 +375,7 @@ def update_config_vars(values):
     _config.NO_JOURNAL = config.pop("no_journal")
     _config.NO_PREALLOC_JOURNAL = config.pop("prealloc_journal") == "off"
     _config.NUM_CLIENTS_PER_FIXTURE = config.pop("num_clients_per_fixture")
+    _config.PERF_REPORT_FILE = config.pop("perf_report_file")
     _config.RANDOM_SEED = config.pop("seed")
     _config.REPEAT = config.pop("repeat")
     _config.REPORT_FAILURE_STATUS = config.pop("report_failure_status")
@@ -338,9 +388,32 @@ def update_config_vars(values):
     _config.STORAGE_ENGINE_CACHE_SIZE = config.pop("storage_engine_cache_size_gb")
     _config.TAG_FILE = config.pop("tag_file")
     _config.TRANSPORT_LAYER = config.pop("transport_layer")
+
+    # Evergreen options.
+    _config.EVERGREEN_BUILD_ID = config.pop("build_id")
+    _config.EVERGREEN_DISTRO_ID = config.pop("distro_id")
+    _config.EVERGREEN_EXECUTION = config.pop("execution_number")
+    _config.EVERGREEN_PATCH_BUILD = config.pop("patch_build")
+    _config.EVERGREEN_PROJECT_NAME = config.pop("project_name")
+    _config.EVERGREEN_REVISION = config.pop("git_revision")
+    _config.EVERGREEN_REVISION_ORDER_ID = config.pop("revision_order_id")
+    _config.EVERGREEN_TASK_ID = config.pop("task_id")
+    _config.EVERGREEN_TASK_NAME = config.pop("task_name")
+    _config.EVERGREEN_VARIANT_NAME = config.pop("variant_name")
+    _config.EVERGREEN_VERSION_ID = config.pop("version_id")
+
+    # Wiredtiger options.
     _config.WT_COLL_CONFIG = config.pop("wt_coll_config")
     _config.WT_ENGINE_CONFIG = config.pop("wt_engine_config")
     _config.WT_INDEX_CONFIG = config.pop("wt_index_config")
+
+    # Benchmark options.
+    _config.BENCHMARK_FILTER = config.pop("benchmark_filter")
+    _config.BENCHMARK_LIST_TESTS = config.pop("benchmark_list_tests")
+    benchmark_min_time = config.pop("benchmark_min_time_secs")
+    if benchmark_min_time is not None:
+        _config.BENCHMARK_MIN_TIME = datetime.timedelta(seconds=benchmark_min_time)
+    _config.BENCHMARK_REPETITIONS = config.pop("benchmark_repetitions")
 
     shuffle = config.pop("shuffle")
     if shuffle == "auto":
@@ -365,10 +438,7 @@ def update_config_vars(values):
 
 
 def _get_logging_config(pathname):
-    """
-    Attempts to read a YAML configuration from 'pathname' that describes
-    how resmoke.py should log the tests and fixtures.
-    """
+    """Read YAML configuration from 'pathname' how to log tests and fixtures."""
 
     # Named loggers are specified as the basename of the file, without the .yml extension.
     if not utils.is_yaml_file(pathname) and not os.path.dirname(pathname):
@@ -383,17 +453,14 @@ def _get_logging_config(pathname):
 
 
 def _expand_user(pathname):
-    """
-    Wrapper around os.path.expanduser() to do nothing when given None.
-    """
+    """Provide wrapper around os.path.expanduser() to do nothing when given None."""
     if pathname is None:
         return None
     return os.path.expanduser(pathname)
 
 
 def _tags_from_list(tags_list):
-    """
-    Returns the list of tags from a list of tag parameter values.
+    """Return the list of tags from a list of tag parameter values.
 
     Each parameter value in the list may be a list of comma separated tags, with empty strings
     ignored.

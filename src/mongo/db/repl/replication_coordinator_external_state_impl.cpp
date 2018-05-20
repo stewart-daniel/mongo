@@ -34,10 +34,10 @@
 
 #include <string>
 
-#include "mongo/base/init.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -48,7 +48,9 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/op_observer.h"
@@ -57,19 +59,17 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/last_vote.h"
-#include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/noop_writer.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
-#include "mongo/db/repl/oplog_buffer_collection.h"
-#include "mongo/db/repl/oplog_buffer_proxy.h"
 #include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
-#include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
@@ -96,16 +96,17 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
-#include "mongo/util/net/listen.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
-
 namespace {
+
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
 using LockGuard = stdx::lock_guard<stdx::mutex>;
 
@@ -118,64 +119,41 @@ const char meCollectionName[] = "local.me";
 const auto meDatabaseName = localDbName;
 const char tsFieldName[] = "ts";
 
-const char kCollectionOplogBufferName[] = "collection";
-const char kBlockingQueueOplogBufferName[] = "inMemoryBlockingQueue";
-
-// Set this to specify whether to use a collection to buffer the oplog on the destination server
-// during initial sync to prevent rolling over the oplog.
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(initialSyncOplogBuffer,
-                                      std::string,
-                                      kCollectionOplogBufferName);
-
-// Set this to specify size of read ahead buffer in the OplogBufferCollection.
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(initialSyncOplogBufferPeekCacheSize, int, 10000);
+MONGO_FP_DECLARE(dropPendingCollectionReaperHang);
 
 // Set this to specify maximum number of times the oplog fetcher will consecutively restart the
 // oplog tailing query on non-cancellation errors.
-server_parameter_storage_type<int, ServerParameterType::kStartupAndRuntime>::value_type
-    oplogFetcherMaxFetcherRestarts(3);
-class ExportedOplogFetcherMaxFetcherRestartsServerParameter
-    : public ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime> {
-public:
-    ExportedOplogFetcherMaxFetcherRestartsServerParameter();
-    Status validate(const int& potentialNewValue) override;
-} _exportedOplogFetcherMaxFetcherRestartsServerParameter;
-
-ExportedOplogFetcherMaxFetcherRestartsServerParameter::
-    ExportedOplogFetcherMaxFetcherRestartsServerParameter()
-    : ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime>(
-          ServerParameterSet::getGlobal(),
-          "oplogFetcherMaxFetcherRestarts",
-          &oplogFetcherMaxFetcherRestarts) {}
-
-Status ExportedOplogFetcherMaxFetcherRestartsServerParameter::validate(
-    const int& potentialNewValue) {
-    if (potentialNewValue < 0) {
-        return Status(ErrorCodes::BadValue,
-                      "oplogFetcherMaxFetcherRestarts must be greater than or equal to 0");
-    }
-    return Status::OK();
-}
-
-MONGO_INITIALIZER(initialSyncOplogBuffer)(InitializerContext*) {
-    if ((initialSyncOplogBuffer != kCollectionOplogBufferName) &&
-        (initialSyncOplogBuffer != kBlockingQueueOplogBufferName)) {
-        return Status(ErrorCodes::BadValue,
-                      "unsupported initial sync oplog buffer option: " + initialSyncOplogBuffer);
-    }
-    return Status::OK();
-}
+MONGO_EXPORT_SERVER_PARAMETER(oplogFetcherMaxFetcherRestarts, int, 3)
+    ->withValidator([](const int& potentialNewValue) {
+        if (potentialNewValue < 0) {
+            return Status(ErrorCodes::BadValue,
+                          "oplogFetcherMaxFetcherRestarts must be nonnegative");
+        }
+        return Status::OK();
+    });
 
 /**
  * Returns new thread pool for thread pool task executor.
  */
-std::unique_ptr<ThreadPool> makeThreadPool() {
+auto makeThreadPool(const std::string& poolName) {
     ThreadPool::Options threadPoolOptions;
-    threadPoolOptions.poolName = "replication";
+    threadPoolOptions.poolName = poolName;
     threadPoolOptions.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
+        AuthorizationSession::get(cc())->grantInternalAuthorization();
     };
     return stdx::make_unique<ThreadPool>(threadPoolOptions);
+}
+
+/**
+ * Returns a new thread pool task executor.
+ */
+auto makeTaskExecutor(ServiceContext* service, const std::string& poolName) {
+    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
+    hookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(service));
+    return stdx::make_unique<executor::ThreadPoolTaskExecutor>(
+        makeThreadPool(poolName),
+        executor::makeNetworkInterface("RS", nullptr, std::move(hookList)));
 }
 
 /**
@@ -193,7 +171,7 @@ void scheduleWork(executor::TaskExecutor* executor,
     if (cbh == ErrorCodes::ShutdownInProgress) {
         return;
     }
-    fassertStatusOK(40460, cbh);
+    fassert(40460, cbh);
 }
 
 }  // namespace
@@ -232,14 +210,25 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     invariant(replCoord);
     invariant(!_bgSync);
     log() << "Starting replication fetcher thread";
-    _bgSync = stdx::make_unique<BackgroundSync>(
-        replCoord, this, _replicationProcess, makeSteadyStateOplogBuffer(opCtx));
+    _oplogBuffer = stdx::make_unique<OplogBufferBlockingQueue>();
+    _oplogBuffer->startup(opCtx);
+
+    _bgSync =
+        stdx::make_unique<BackgroundSync>(replCoord, this, _replicationProcess, _oplogBuffer.get());
     _bgSync->startup(opCtx);
 
     log() << "Starting replication applier thread";
-    invariant(!_applierThread);
-    _applierThread.reset(new RSDataSync{_bgSync.get(), replCoord});
-    _applierThread->startup();
+    invariant(!_oplogApplier);
+    _oplogApplier = stdx::make_unique<OplogApplier>(_oplogApplierTaskExecutor.get(),
+                                                    _oplogBuffer.get(),
+                                                    _bgSync.get(),
+                                                    replCoord,
+                                                    _replicationProcess->getConsistencyMarkers(),
+                                                    _storageInterface,
+                                                    OplogApplier::Options(),
+                                                    _writerPool.get());
+    _oplogApplierShutdownFuture = _oplogApplier->startup();
+
     log() << "Starting replication reporter thread";
     invariant(!_syncSourceFeedbackThread);
     // Get the pointer while holding the lock so that _stopDataReplication_inlock() won't
@@ -263,8 +252,9 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(Operat
     _stoppingDataReplication = true;
 
     auto oldSSF = std::move(_syncSourceFeedbackThread);
+    auto oldOplogBuffer = std::move(_oplogBuffer);
     auto oldBgSync = std::move(_bgSync);
-    auto oldApplier = std::move(_applierThread);
+    auto oldApplier = std::move(_oplogApplier);
     lock->unlock();
 
     // _syncSourceFeedbackThread should be joined before _bgSync's shutdown because it has
@@ -282,11 +272,29 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(Operat
 
     if (oldApplier) {
         log() << "Stopping replication applier thread";
-        oldApplier->join();
+        oldApplier->shutdown();
+    }
+
+    // Clear the buffer. This unblocks the OplogFetcher if it is blocked with a full queue, but
+    // ensures that it won't add anything. It will also unblock the OplogApplier pipeline if it is
+    // waiting for an operation to be past the slaveDelay point.
+    if (oldOplogBuffer) {
+        oldOplogBuffer->clear(opCtx);
+        if (oldBgSync) {
+            oldBgSync->onBufferCleared();
+        }
     }
 
     if (oldBgSync) {
         oldBgSync->join(opCtx);
+    }
+
+    if (oldApplier) {
+        _oplogApplierShutdownFuture.get();
+    }
+
+    if (oldOplogBuffer) {
+        oldOplogBuffer->shutdown(opCtx);
     }
 
     lock->lock();
@@ -302,22 +310,17 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
     }
 
     log() << "Starting replication storage threads";
-    _service->getGlobalStorageEngine()->setJournalListener(this);
+    _service->getStorageEngine()->setJournalListener(this);
 
-    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
-    hookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(_service));
-    _taskExecutor = stdx::make_unique<executor::ThreadPoolTaskExecutor>(
-        makeThreadPool(),
-        executor::makeNetworkInterface("NetworkInterfaceASIO-RS", nullptr, std::move(hookList)));
+    _oplogApplierTaskExecutor = makeTaskExecutor(_service, "rsSync");
+    _oplogApplierTaskExecutor->startup();
+
+    _taskExecutor = makeTaskExecutor(_service, "replication");
     _taskExecutor->startup();
 
     _writerPool = SyncTail::makeWriterPool();
 
     _startedThreads = true;
-}
-
-void ReplicationCoordinatorExternalStateImpl::startMasterSlave(OperationContext* opCtx) {
-    repl::startMasterSlave(opCtx);
 }
 
 void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) {
@@ -336,6 +339,9 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
 
     log() << "Stopping replication storage threads";
     _taskExecutor->shutdown();
+    _oplogApplierTaskExecutor->shutdown();
+
+    _oplogApplierTaskExecutor->join();
     _taskExecutor->join();
     lk.unlock();
 
@@ -358,14 +364,14 @@ executor::TaskExecutor* ReplicationCoordinatorExternalStateImpl::getTaskExecutor
     return _taskExecutor.get();
 }
 
-OldThreadPool* ReplicationCoordinatorExternalStateImpl::getDbWorkThreadPool() const {
+ThreadPool* ReplicationCoordinatorExternalStateImpl::getDbWorkThreadPool() const {
     return _writerPool.get();
 }
 
 Status ReplicationCoordinatorExternalStateImpl::runRepairOnLocalDB(OperationContext* opCtx) {
     try {
         Lock::GlobalWrite globalWrite(opCtx);
-        StorageEngine* engine = getGlobalServiceContext()->getGlobalStorageEngine();
+        StorageEngine* engine = getGlobalServiceContext()->getStorageEngine();
 
         if (!engine->isMmapV1()) {
             return Status::OK();
@@ -375,7 +381,7 @@ Status ReplicationCoordinatorExternalStateImpl::runRepairOnLocalDB(OperationCont
         Status status = repairDatabase(opCtx, engine, localDbName, false, false);
 
         // Open database before returning
-        dbHolder().openDb(opCtx, localDbName);
+        DatabaseHolder::getDatabaseHolder().openDb(opCtx, localDbName);
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
@@ -409,27 +415,29 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
                                waitForAllEarlierOplogWritesToBeVisible(opCtx);
                            });
 
-        // Set UUIDs for all non-replicated collections. This is necessary for independent replica
-        // sets and config server replica sets started with no data files because collections in
-        // local are created prior to the featureCompatibilityVersion being set to 3.6, so the
-        // collections are not created with UUIDs. We exclude ShardServers when adding UUIDs to
-        // non-replicated collections on the primary because ShardServers are started up by default
-        // with featureCompatibilityVersion 3.4, so we don't want to assign UUIDs to them until the
-        // cluster's featureCompatibilityVersion is explicitly set to 3.6 by the config server. The
-        // below UUID addition for non-replicated collections only occurs on the primary; UUIDs are
-        // added to non-replicated collections on secondaries during InitialSync. When the config
-        // server sets the featureCompatibilityVersion to 3.6, the shard primary will add UUIDs to
-        // all the collections that need them. One special case here is if a shard is already in
-        // featureCompatibilityVersion 3.6 and a new node is started up with --shardsvr and added to
-        // that shard, the new node will still start up with featureCompatibilityVersion 3.4 and
-        // need to have UUIDs added to each collection. These UUIDs are added during InitialSync,
-        // because the new node is a secondary.
-        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
-            FeatureCompatibilityVersion::isCleanStartUp()) {
-            auto schemaStatus = updateUUIDSchemaVersionNonReplicated(opCtx, true);
-            if (!schemaStatus.isOK()) {
-                return schemaStatus;
-            }
+        // Update unique index format version for all non-replicated collections. It is possible
+        // for MongoDB to have a "clean startup", i.e., no non-local databases, but still have
+        // unique indexes on collections in the local database. On clean startup,
+        // setFeatureCompatibilityVersion (which updates the unique index format version of
+        // collections) is not called, so any pre-existing collections are upgraded here. We exclude
+        // ShardServers when updating indexes belonging to non-replicated collections on the primary
+        // because ShardServers are started up by default with featureCompatibilityVersion 4.0, so
+        // we don't want to update those indexes until the cluster's featureCompatibilityVersion is
+        // explicitly set to 4.2 by config server. The below unique index update for non-replicated
+        // collections only occurs on the primary; updates for unique indexes belonging to
+        // non-replicated collections are done on secondaries during InitialSync. When the config
+        // server sets the featureCompatibilityVersion to 4.2, the shard primary will update unique
+        // indexes belonging to all the collections. One special case here is if a shard is already
+        // in featureCompatibilityVersion 4.2 and a new node is started up with --shardsvr and added
+        // to that shard, the new node will still start up with featureCompatibilityVersion 4.0 and
+        // may need to have unique index version updated. Such indexes would be updated during
+        // InitialSync because the new node is a secondary.
+        // TODO(SERVER-34489) Add a check for latest FCV when upgrade/downgrade is ready.
+        if (FeatureCompatibilityVersion::isCleanStartUp() &&
+            serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+            auto updateStatus = updateNonReplicatedUniqueIndexes(opCtx);
+            if (!updateStatus.isOK())
+                return updateStatus;
         }
         FeatureCompatibilityVersion::setIfCleanStartup(opCtx, _storageInterface);
     } catch (const DBException& ex) {
@@ -480,7 +488,7 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
             wuow.commit();
         });
     }
-    const auto opTimeToReturn = fassertStatusOK(28665, loadLastOpTime(opCtx));
+    const auto opTimeToReturn = fassert(28665, loadLastOpTime(opCtx));
 
     _shardingOnTransitionToPrimaryHook(opCtx);
     _dropAllTempCollections(opCtx);
@@ -492,34 +500,6 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
 
 void ReplicationCoordinatorExternalStateImpl::forwardSlaveProgress() {
     _syncSourceFeedback.forwardSlaveProgress();
-}
-
-OID ReplicationCoordinatorExternalStateImpl::ensureMe(OperationContext* opCtx) {
-    std::string myname = getHostName();
-    OID myRID;
-    {
-        Lock::DBLock lock(opCtx, meDatabaseName, MODE_X);
-
-        BSONObj me;
-        // local.me is an identifier for a server for getLastError w:2+
-        // TODO: handle WriteConflictExceptions below
-        if (!Helpers::getSingleton(opCtx, meCollectionName, me) || !me.hasField("host") ||
-            me["host"].String() != myname) {
-            myRID = OID::gen();
-
-            // clean out local.me
-            Helpers::emptyCollection(opCtx, NamespaceString(meCollectionName));
-
-            // repopulate
-            BSONObjBuilder b;
-            b.append("_id", myRID);
-            b.append("host", myname);
-            Helpers::putSingleton(opCtx, meCollectionName, b.done());
-        } else {
-            myRID = me["_id"].OID();
-        }
-    }
-    return myRID;
 }
 
 StatusWith<BSONObj> ReplicationCoordinatorExternalStateImpl::loadLocalConfigDocument(
@@ -579,6 +559,10 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
     try {
         Status status =
             writeConflictRetry(opCtx, "save replica set lastVote", lastVoteCollectionName, [&] {
+                // If we are casting a vote in a new election immediately after stepping down, we
+                // don't want to have this process interrupted due to us stepping down, since we
+                // want to be able to cast our vote for a new primary right away.
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
                 Lock::DBLock dbWriteLock(opCtx, lastVoteDatabaseName, MODE_X);
 
                 // If there is no last vote document, we want to store one. Otherwise, we only want
@@ -673,6 +657,18 @@ void ReplicationCoordinatorExternalStateImpl::closeConnections() {
 void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationContext* opCtx) {
     ServiceContext* environment = opCtx->getServiceContext();
     environment->killAllUserOperations(opCtx, ErrorCodes::InterruptedDueToReplStateChange);
+
+    // Destroy all stashed transaction resources, in order to release locks.
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    bool killCursors = false;
+    killSessionsLocalKillTransactions(opCtx, matcherAllSessions, killCursors);
+}
+
+void ReplicationCoordinatorExternalStateImpl::killAllTransactionCursors(OperationContext* opCtx) {
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    killSessionsLocalKillTransactionCursors(opCtx, matcherAllSessions);
 }
 
 void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
@@ -680,7 +676,7 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
         Balancer::get(_service)->interruptBalancer();
     } else if (ShardingState::get(_service)->enabled()) {
         invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
-        ShardingState::get(_service)->interruptChunkSplitter();
+        ChunkSplitter::get(_service).onStepDown();
         CatalogCacheLoader::get(_service).onStepDown();
     }
 
@@ -706,7 +702,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         return;
     }
 
-    fassertStatusOK(40107, status);
+    fassert(40107, status);
 
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         status = ShardingCatalogManager::get(opCtx)->initializeConfigDatabaseIfNeeded(opCtx);
@@ -738,7 +734,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
                 return;
             }
 
-            fassertStatusOK(40217, status);
+            fassert(40217, status);
         }
 
         // Free any leftover locks from previous instantiations.
@@ -764,7 +760,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         }
 
         CatalogCacheLoader::get(_service).onStepUp();
-        ShardingState::get(_service)->initiateChunkSplitter();
+        ChunkSplitter::get(_service).onStepUp();
     } else {  // unsharded
         if (auto validator = LogicalTimeValidator::get(_service)) {
             validator->enableKeyGenerator(opCtx, true);
@@ -772,6 +768,8 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
     }
 
     SessionCatalog::get(_service)->onStepUp(opCtx);
+
+    notifyFreeMonitoringOnTransitionToPrimary();
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
@@ -797,7 +795,7 @@ void ReplicationCoordinatorExternalStateImpl::startProducerIfStopped() {
 
 void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationContext* opCtx) {
     std::vector<std::string> dbNames;
-    StorageEngine* storageEngine = _service->getGlobalStorageEngine();
+    StorageEngine* storageEngine = _service->getStorageEngine();
     storageEngine->listDatabases(&dbNames);
 
     for (std::vector<std::string>::iterator it = dbNames.begin(); it != dbNames.end(); ++it) {
@@ -806,31 +804,38 @@ void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationC
         if (*it == "local")
             continue;
         LOG(2) << "Removing temporary collections from " << *it;
-        Database* db = dbHolder().get(opCtx, *it);
+        Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, *it);
         // Since we must be holding the global lock during this function, if listDatabases
         // returned this dbname, we should be able to get a reference to it - it can't have
         // been dropped.
-        invariant(db);
+        invariant(db, str::stream() << "Unable to get reference to database " << *it);
         db->clearTmpCollections(opCtx);
     }
 }
 
 void ReplicationCoordinatorExternalStateImpl::dropAllSnapshots() {
-    if (auto manager = _service->getGlobalStorageEngine()->getSnapshotManager())
+    if (auto manager = _service->getStorageEngine()->getSnapshotManager())
         manager->dropAllSnapshots();
 }
 
 void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(
     const OpTime& newCommitPoint) {
-    auto manager = _service->getGlobalStorageEngine()->getSnapshotManager();
+    auto manager = _service->getStorageEngine()->getSnapshotManager();
     if (manager) {
         manager->setCommittedSnapshot(newCommitPoint.getTimestamp());
     }
     notifyOplogMetadataWaiters(newCommitPoint);
 }
 
+void ReplicationCoordinatorExternalStateImpl::updateLocalSnapshot(const OpTime& optime) {
+    auto manager = _service->getStorageEngine()->getSnapshotManager();
+    if (manager) {
+        manager->setLocalSnapshot(optime.getTimestamp());
+    }
+}
+
 bool ReplicationCoordinatorExternalStateImpl::snapshotsEnabled() const {
-    return _service->getGlobalStorageEngine()->getSnapshotManager() != nullptr;
+    return _service->getStorageEngine()->getSnapshotManager() != nullptr;
 }
 
 void ReplicationCoordinatorExternalStateImpl::notifyOplogMetadataWaiters(
@@ -845,11 +850,25 @@ void ReplicationCoordinatorExternalStateImpl::notifyOplogMetadataWaiters(
             scheduleWork(
                 _taskExecutor.get(),
                 [committedOpTime, reaper](const executor::TaskExecutor::CallbackArgs& args) {
+                    if (MONGO_FAIL_POINT(dropPendingCollectionReaperHang)) {
+                        log() << "fail point dropPendingCollectionReaperHang enabled. "
+                                 "Blocking until fail point is disabled. "
+                                 "committedOpTime: "
+                              << committedOpTime;
+                        MONGO_FAIL_POINT_PAUSE_WHILE_SET(dropPendingCollectionReaperHang);
+                    }
                     auto opCtx = cc().makeOperationContext();
                     reaper->dropCollectionsOlderThan(opCtx.get(), committedOpTime);
+                    auto replCoord = ReplicationCoordinator::get(opCtx.get());
+                    replCoord->signalDropPendingCollectionsRemovedFromStorage();
                 });
         }
     }
+}
+
+boost::optional<OpTime> ReplicationCoordinatorExternalStateImpl::getEarliestDropPendingOpTime()
+    const {
+    return _dropPendingCollectionReaper->getEarliestDropOpTime();
 }
 
 double ReplicationCoordinatorExternalStateImpl::getElectionTimeoutOffsetLimitFraction() const {
@@ -858,7 +877,7 @@ double ReplicationCoordinatorExternalStateImpl::getElectionTimeoutOffsetLimitFra
 
 bool ReplicationCoordinatorExternalStateImpl::isReadCommittedSupportedByStorageEngine(
     OperationContext* opCtx) const {
-    auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     // This should never be called if the storage engine has not been initialized.
     invariant(storageEngine);
     return storageEngine->getSnapshotManager();
@@ -866,49 +885,10 @@ bool ReplicationCoordinatorExternalStateImpl::isReadCommittedSupportedByStorageE
 
 bool ReplicationCoordinatorExternalStateImpl::isReadConcernSnapshotSupportedByStorageEngine(
     OperationContext* opCtx) const {
-    auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     // This should never be called if the storage engine has not been initialized.
     invariant(storageEngine);
     return storageEngine->supportsReadConcernSnapshot();
-}
-
-StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::multiApply(
-    OperationContext* opCtx,
-    MultiApplier::Operations ops,
-    MultiApplier::ApplyOperationFn applyOperation) {
-    return repl::multiApply(opCtx, _writerPool.get(), std::move(ops), applyOperation);
-}
-
-Status ReplicationCoordinatorExternalStateImpl::multiInitialSyncApply(
-    MultiApplier::OperationPtrs* ops,
-    const HostAndPort& source,
-    AtomicUInt32* fetchCount,
-    WorkerMultikeyPathInfo* workerMultikeyPathInfo) {
-    // repl::multiInitialSyncApply uses SyncTail::shouldRetry() (and implicitly getMissingDoc())
-    // to fetch missing documents during initial sync. Therefore, it is fine to construct SyncTail
-    // with invalid BackgroundSync, MultiSyncApplyFunc and writerPool arguments because we will not
-    // be accessing any SyncTail functionality that require these constructor parameters.
-    SyncTail syncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr);
-    syncTail.setHostname(source.toString());
-    return repl::multiInitialSyncApply(ops, &syncTail, fetchCount, workerMultikeyPathInfo);
-}
-
-std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateImpl::makeInitialSyncOplogBuffer(
-    OperationContext* opCtx) const {
-    if (initialSyncOplogBuffer == kCollectionOplogBufferName) {
-        invariant(initialSyncOplogBufferPeekCacheSize >= 0);
-        OplogBufferCollection::Options options;
-        options.peekCacheSize = std::size_t(initialSyncOplogBufferPeekCacheSize);
-        return stdx::make_unique<OplogBufferProxy>(
-            stdx::make_unique<OplogBufferCollection>(StorageInterface::get(opCtx), options));
-    } else {
-        return stdx::make_unique<OplogBufferBlockingQueue>();
-    }
-}
-
-std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateImpl::makeSteadyStateOplogBuffer(
-    OperationContext* opCtx) const {
-    return stdx::make_unique<OplogBufferBlockingQueue>();
 }
 
 std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherMaxFetcherRestarts() const {

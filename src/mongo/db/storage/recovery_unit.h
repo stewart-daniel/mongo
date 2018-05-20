@@ -35,6 +35,8 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/snapshot.h"
 
 namespace mongo {
@@ -53,12 +55,6 @@ public:
     virtual ~RecoveryUnit() {}
 
     /**
-     * A storage engine may elect to append state information to the passed BSONObjBuilder.  This
-     * function is not currently called by any MongoDB command, but may in the future.
-     */
-    virtual void reportState(BSONObjBuilder* b) const {}
-
-    /**
      * These should be called through WriteUnitOfWork rather than directly.
      *
      * A call to 'beginUnitOfWork' marks the beginning of a unit of work. Each call to
@@ -71,11 +67,49 @@ public:
     virtual void abortUnitOfWork() = 0;
 
     /**
-     * Waits until all commits that happened before this call are durable. Returns true, unless the
-     * storage engine cannot guarantee durability, which should never happen when isDurable()
-     * returned true. This cannot be called from inside a unit of work, and should fail if it is.
+     * Must be called after beginUnitOfWork and before calling either abortUnitOfWork or
+     * commitUnitOfWork. Transitions the current transaction (unit of work) to the
+     * "prepared" state. Must be overridden by storage engines that support prepared
+     * transactions.
+     *
+     * Must be preceded by a call to setPrepareTimestamp().
+     *
+     * It is not valid to call commitUnitOfWork() afterward without calling setCommitTimestamp()
+     * with a value greater than or equal to the prepare timestamp.
+     * This cannot be called after setTimestamp or setCommitTimestamp.
+     */
+    virtual void prepareUnitOfWork() {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "This storage engine does not support prepared transactions");
+    }
+
+
+    /**
+     * Sets whether or not to ignore prepared transactions if supported by this storage engine. When
+     * 'ignore' is true, allows reading data in prepared, but uncommitted transactions.
+     */
+    virtual void setIgnorePrepared(bool ignore) {}
+
+    /**
+     * Waits until all commits that happened before this call are durable in the journal. Returns
+     * true, unless the storage engine cannot guarantee durability, which should never happen when
+     * isDurable() returned true. This cannot be called from inside a unit of work, and should
+     * fail if it is.
      */
     virtual bool waitUntilDurable() = 0;
+
+    /**
+     * Unlike `waitUntilDurable`, this method takes a stable checkpoint, making durable any writes
+     * on unjournaled tables that are behind the current stable timestamp. If the storage engine
+     * is starting from an "unstable" checkpoint, this method call will turn into an unstable
+     * checkpoint.
+     *
+     * This must not be called by a system taking user writes until after a stable timestamp is
+     * passed to the storage engine.
+     */
+    virtual bool waitUntilUnjournaledWritesDurable() {
+        return waitUntilDurable();
+    }
 
     /**
      * When this is called, if there is an open transaction, it is closed. On return no
@@ -93,9 +127,8 @@ public:
     virtual void preallocateSnapshot() {}
 
     /**
-     * Informs this RecoveryUnit that all future reads through it should be from a snapshot
-     * marked as Majority Committed. Snapshots should still be separately acquired and newer
-     * committed snapshots should be used if available whenever implementations would normally
+     * Obtains a majority committed snapshot. Snapshots should still be separately acquired and
+     * newer committed snapshots should be used if available whenever implementations would normally
      * change snapshots.
      *
      * If no snapshot has yet been marked as Majority Committed, returns a status with error code
@@ -107,28 +140,25 @@ public:
      * StorageEngines that don't support a SnapshotManager should use the default
      * implementation.
      */
-    virtual Status setReadFromMajorityCommittedSnapshot() {
+    virtual Status obtainMajorityCommittedSnapshot() {
         return {ErrorCodes::CommandNotSupported,
                 "Current storage engine does not support majority readConcerns"};
     }
 
     /**
-     * Returns true if setReadFromMajorityCommittedSnapshot() has been called.
-     */
-    virtual bool isReadingFromMajorityCommittedSnapshot() const {
-        return false;
-    }
-
-    /**
      * Returns the Timestamp being used by this recovery unit or boost::none if not reading from
-     * a majority committed snapshot.
-     *
-     * It is possible for reads to occur from later snapshots, but they may not occur from earlier
-     * snapshots.
+     * a point in time. Any point in time returned will reflect one of the following:
+     *  - when using ReadSource::kProvided, the timestamp provided.
+     *  - when using ReadSource::kLastAppliedSnapshot, the timestamp chosen using the storage
+     * engine's last applied timestamp.
+     *  - when using ReadSource::kLastApplied, the last applied timestamp at which the current
+     * storage transaction was opened, if one is open.
+     *  - when using ReadSource::kMajorityCommitted, the majority committed timestamp chosen by the
+     * storage engine after a transaction has been opened or after a call to
+     * obtainMajorityCommittedSnapshot().
      */
-    virtual boost::optional<Timestamp> getMajorityCommittedSnapshot() const {
-        dassert(!isReadingFromMajorityCommittedSnapshot());
-        return {};
+    virtual boost::optional<Timestamp> getPointInTimeReadTimestamp() const {
+        return boost::none;
     }
 
     /**
@@ -169,12 +199,45 @@ public:
     }
 
     /**
-     * Chooses which timestamp to use for read transactions.
+     * Sets a prepare timestamp for the current transaction. A subsequent call to
+     * prepareUnitOfWork() is expected and required.
+     * This cannot be called after setTimestamp or setCommitTimestamp.
+     * This must be called inside a WUOW and may only be called once.
      */
-    virtual Status selectSnapshot(Timestamp timestamp) {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "point-in-time reads are not implemented for this storage engine");
+    virtual void setPrepareTimestamp(Timestamp timestamp) {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "This storage engine does not support prepared transactions");
     }
+
+    /**
+     * When no read timestamp is provided to the recovery unit, the ReadSource indicates which
+     * external timestamp source to read from.
+     */
+    enum ReadSource {
+        kNone,               // Do not read from a timestamp. This is the default.
+        kMajorityCommitted,  // Read from the majority all-commmitted timestamp.
+        kLastApplied,  // Read from the last applied timestamp. New transactions start at the most
+                       // up-to-date timestamp.
+        kLastAppliedSnapshot,  // Read from the last applied timestamp. New transactions will always
+                               // read from the same timestamp and never advance.
+        kProvided              // Read from the timestamp provided to setTimestampReadSource.
+    };
+
+    /**
+     * Sets which timestamp to use for read transactions. If 'provided' is supplied, only kProvided
+     * is an acceptable input.
+     *
+     * Must be called in one of the following cases:
+     * - a transaction is not active
+     * - no read source has been set yet
+     * - the read source provided is the same as the existing read source
+     */
+    virtual void setTimestampReadSource(ReadSource source,
+                                        boost::optional<Timestamp> provided = boost::none) {}
+
+    virtual ReadSource getTimestampReadSource() const {
+        return ReadSource::kNone;
+    };
 
     /**
      * A Change is an action that is registerChange()'d while a WriteUnitOfWork exists. The
@@ -186,13 +249,17 @@ public:
      * that rollback() and commit() may be called after resources with a shorter lifetime than
      * the WriteUnitOfWork have been freed. Each registered change will be committed or rolled
      * back once.
+     *
+     * commit() handlers are passed the timestamp at which the transaction is committed. If the
+     * transaction is not committed at a particular timestamp, or if the storage engine does not
+     * support timestamps, then boost::none will be supplied for this parameter.
      */
     class Change {
     public:
         virtual ~Change() {}
 
         virtual void rollback() = 0;
-        virtual void commit() = 0;
+        virtual void commit(boost::optional<Timestamp> commitTime) = 0;
     };
 
     /**
@@ -219,7 +286,7 @@ public:
             void rollback() final {
                 _callback();
             }
-            void commit() final {}
+            void commit(boost::optional<Timestamp>) final {}
 
         private:
             Callback _callback;
@@ -239,8 +306,8 @@ public:
         public:
             OnCommitChange(Callback&& callback) : _callback(std::move(callback)) {}
             void rollback() final {}
-            void commit() final {
-                _callback();
+            void commit(boost::optional<Timestamp> commitTime) final {
+                _callback(commitTime);
             }
 
         private:
@@ -293,6 +360,8 @@ public:
      * Setting the flag may permit increased performance.
      */
     virtual void setRollbackWritesDisabled() = 0;
+
+    virtual void setOrderedCommit(bool orderedCommit) = 0;
 
 protected:
     RecoveryUnit() {}

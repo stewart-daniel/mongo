@@ -137,7 +137,7 @@ Message DBClientCursor::_assembleInit() {
 Message DBClientCursor::_assembleGetMore() {
     invariant(cursorId);
     if (_useFindCommand) {
-        long long batchSize = nextBatchSize();
+        std::int64_t batchSize = nextBatchSize();
         auto gmr = GetMoreRequest(ns,
                                   cursorId,
                                   boost::make_optional(batchSize != 0, batchSize),
@@ -305,7 +305,7 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
         invariant(qr.getCursorId() == 0);
 
         if (!(opts & QueryOption_CursorTailable)) {
-            uasserted(13127,
+            uasserted(ErrorCodes::CursorNotFound,
                       str::stream() << "cursor id " << cursorId << " didn't exist on server.");
         }
 

@@ -41,7 +41,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/replication_process.h"
-#include "mongo/db/repl/replication_recovery_mock.h"
+#include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/logger/log_component.h"
@@ -69,20 +69,21 @@ ReplSettings createReplSettings() {
 
 void RollbackTest::setUp() {
     _serviceContextMongoDTest.setUp();
+    _storageInterface = new StorageInterfaceRollback();
     auto serviceContext = _serviceContextMongoDTest.getServiceContext();
+    auto consistencyMarkers = stdx::make_unique<ReplicationConsistencyMarkersMock>();
+    auto recovery =
+        stdx::make_unique<ReplicationRecoveryImpl>(_storageInterface, consistencyMarkers.get());
     _replicationProcess = stdx::make_unique<ReplicationProcess>(
-        &_storageInterface,
-        stdx::make_unique<ReplicationConsistencyMarkersMock>(),
-        stdx::make_unique<ReplicationRecoveryMock>());
-    _dropPendingCollectionReaper = new DropPendingCollectionReaper(&_storageInterface);
+        _storageInterface, std::move(consistencyMarkers), std::move(recovery));
+    _dropPendingCollectionReaper = new DropPendingCollectionReaper(_storageInterface);
     DropPendingCollectionReaper::set(
         serviceContext, std::unique_ptr<DropPendingCollectionReaper>(_dropPendingCollectionReaper));
+    StorageInterface::set(serviceContext, std::unique_ptr<StorageInterface>(_storageInterface));
     _coordinator = new ReplicationCoordinatorRollbackMock(serviceContext);
     ReplicationCoordinator::set(serviceContext,
                                 std::unique_ptr<ReplicationCoordinator>(_coordinator));
     setOplogCollectionName(serviceContext);
-
-    SessionCatalog::create(serviceContext);
 
     _opCtx = cc().makeOperationContext();
     _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(_opCtx.get(), {});
@@ -98,11 +99,11 @@ void RollbackTest::tearDown() {
     _coordinator = nullptr;
     _opCtx.reset();
 
-    SessionCatalog::reset_forTest(_serviceContextMongoDTest.getServiceContext());
+    SessionCatalog::get(_serviceContextMongoDTest.getServiceContext())->reset_forTest();
 
     // We cannot unset the global replication coordinator because ServiceContextMongoD::tearDown()
-    // calls dropAllDatabasesExceptLocal() which requires the replication coordinator to clear all
-    // snapshots.
+    // calls Databse::dropAllDatabasesExceptLocal() which requires the replication coordinator to
+    // clear all snapshots.
     _serviceContextMongoDTest.tearDown();
 
     // ServiceContextMongoD::tearDown() does not destroy service context so it is okay
@@ -115,9 +116,6 @@ void RollbackTest::tearDown() {
 RollbackTest::ReplicationCoordinatorRollbackMock::ReplicationCoordinatorRollbackMock(
     ServiceContext* service)
     : ReplicationCoordinatorMock(service, createReplSettings()) {}
-
-void RollbackTest::ReplicationCoordinatorRollbackMock::resetLastOpTimesFromOplog(
-    OperationContext* opCtx, ReplicationCoordinator::DataConsistency consistency) {}
 
 void RollbackTest::ReplicationCoordinatorRollbackMock::failSettingFollowerMode(
     const MemberState& transitionToFail, ErrorCodes::Error codeToFailWith) {
@@ -181,7 +179,7 @@ Collection* RollbackTest::_createCollection(OperationContext* opCtx,
                                             const CollectionOptions& options) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
     mongo::WriteUnitOfWork wuow(opCtx);
-    auto db = dbHolder().openDb(opCtx, nss.db());
+    auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, nss.db());
     ASSERT_TRUE(db);
     db->dropCollection(opCtx, nss.ns()).transitional_ignore();
     auto coll = db->createCollection(opCtx, nss.ns(), options);
@@ -199,7 +197,7 @@ Collection* RollbackTest::_createCollection(OperationContext* opCtx,
 Status RollbackTest::_insertOplogEntry(const BSONObj& doc) {
     TimestampedBSONObj obj;
     obj.obj = doc;
-    return _storageInterface.insertDocument(
+    return _storageInterface->insertDocument(
         _opCtx.get(), NamespaceString::kRsOplogNamespace, obj, 0);
 }
 
@@ -279,8 +277,18 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
     auto nss = NamespaceString(dbName, collName);
 
     auto coll = _createCollection(_opCtx.get(), nss.toString(), localCollOptions);
-    auto commonOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+
+    auto commonOpUuid = unittest::assertGet(UUID::parse("f005ba11-cafe-bead-f00d-123456789abc"));
+    auto commonOpBson = BSON("ts" << Timestamp(1, 1) << "h" << 1LL << "t" << 1LL << "op"
+                                  << "n"
+                                  << "o"
+                                  << BSONObj()
+                                  << "ns"
+                                  << "rollback_test.test"
+                                  << "ui"
+                                  << commonOpUuid);
+
+    auto commonOperation = std::make_pair(commonOpBson, RecordId(1));
 
     auto collectionModificationOperation =
         makeCommandOp(Timestamp(Seconds(2), 0), coll->uuid(), nss.toString(), collModCmd, 2);

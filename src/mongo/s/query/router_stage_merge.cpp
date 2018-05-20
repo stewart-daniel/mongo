@@ -40,43 +40,21 @@ namespace mongo {
 RouterStageMerge::RouterStageMerge(OperationContext* opCtx,
                                    executor::TaskExecutor* executor,
                                    ClusterClientCursorParams* params)
-    : RouterExecStage(opCtx), _executor(executor), _params(params), _arm(opCtx, executor, params) {}
+    : RouterExecStage(opCtx),
+      _executor(executor),
+      _params(params),
+      _arm(opCtx, executor, params->extractARMParams()) {}
 
 StatusWith<ClusterQueryResult> RouterStageMerge::next(ExecContext execCtx) {
     // Non-tailable and tailable non-awaitData cursors always block until ready(). AwaitData
     // cursors wait for ready() only until a specified time limit is exceeded.
-    return (_params->tailableMode == TailableMode::kTailableAndAwaitData
+    return (_params->tailableMode == TailableModeEnum::kTailableAndAwaitData
                 ? awaitNextWithTimeout(execCtx)
-                : blockForNextNoTimeout(execCtx));
-}
-
-StatusWith<ClusterQueryResult> RouterStageMerge::blockForNextNoTimeout(ExecContext execCtx) {
-    invariant(_params->tailableMode != TailableMode::kTailableAndAwaitData);
-    invariant(getOpCtx());
-    while (!_arm.ready()) {
-        auto nextEventStatus = _arm.nextEvent();
-        if (!nextEventStatus.isOK()) {
-            return nextEventStatus.getStatus();
-        }
-        auto event = nextEventStatus.getValue();
-
-        // Block until there are further results to return.
-        auto status = _executor->waitForEvent(getOpCtx(), event);
-
-        if (!status.isOK()) {
-            return status.getStatus();
-        }
-
-        // We have not provided a deadline, so if the wait returns without interruption, we do not
-        // expect to have timed out.
-        invariant(status.getValue() == stdx::cv_status::no_timeout);
-    }
-
-    return _arm.nextReady();
+                : _arm.blockingNext());
 }
 
 StatusWith<ClusterQueryResult> RouterStageMerge::awaitNextWithTimeout(ExecContext execCtx) {
-    invariant(_params->tailableMode == TailableMode::kTailableAndAwaitData);
+    invariant(_params->tailableMode == TailableModeEnum::kTailableAndAwaitData);
     // If we are in kInitialFind or kGetMoreWithAtLeastOneResultInBatch context and the ARM is not
     // ready, we don't block. Fall straight through to the return statement.
     while (!_arm.ready() && execCtx == ExecContext::kGetMoreNoResultsYet) {
@@ -110,7 +88,19 @@ StatusWith<ClusterQueryResult> RouterStageMerge::awaitNextWithTimeout(ExecContex
 StatusWith<EventHandle> RouterStageMerge::getNextEvent() {
     // If we abandoned a previous event due to a mongoS-side timeout, wait for it first.
     if (_leftoverEventFromLastTimeout) {
-        invariant(_params->tailableMode == TailableMode::kTailableAndAwaitData);
+        invariant(_params->tailableMode == TailableModeEnum::kTailableAndAwaitData);
+        // If we have an outstanding event from last time, then we might have to manually schedule
+        // some getMores for the cursors. If a remote response came back while we were between
+        // getMores (from the user to mongos), the response may have been an empty batch, and the
+        // ARM would not be able to ask for the next batch immediately since it is not attached to
+        // an OperationContext. Now that we have a valid OperationContext, we schedule the getMores
+        // ourselves.
+        Status getMoreStatus = _arm.scheduleGetMores();
+        if (!getMoreStatus.isOK()) {
+            return getMoreStatus;
+        }
+
+        // Return the leftover event and clear '_leftoverEventFromLastTimeout'.
         auto event = _leftoverEventFromLastTimeout;
         _leftoverEventFromLastTimeout = EventHandle();
         return event;
@@ -120,26 +110,23 @@ StatusWith<EventHandle> RouterStageMerge::getNextEvent() {
 }
 
 void RouterStageMerge::kill(OperationContext* opCtx) {
-    auto killEvent = _arm.kill(opCtx);
-    if (!killEvent) {
-        // Mongos is shutting down.
-        return;
-    }
-    _executor->waitForEvent(killEvent);
+    _arm.blockingKill(opCtx);
 }
 
 bool RouterStageMerge::remotesExhausted() {
     return _arm.remotesExhausted();
 }
 
+std::size_t RouterStageMerge::getNumRemotes() const {
+    return _arm.getNumRemotes();
+}
+
 Status RouterStageMerge::doSetAwaitDataTimeout(Milliseconds awaitDataTimeout) {
     return _arm.setAwaitDataTimeout(awaitDataTimeout);
 }
 
-void RouterStageMerge::addNewShardCursors(
-    std::vector<ClusterClientCursorParams::RemoteCursor>&& newShards) {
-    _arm.addNewShardCursors(newShards);
-    std::move(newShards.begin(), newShards.end(), std::back_inserter(_params->remotes));
+void RouterStageMerge::addNewShardCursors(std::vector<RemoteCursor>&& newShards) {
+    _arm.addNewShardCursors(std::move(newShards));
 }
 
 }  // namespace mongo

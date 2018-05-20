@@ -41,6 +41,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/jsobj.h"
 
@@ -100,11 +101,5 @@ public:
         return true;
     }
 };
-MONGO_INITIALIZER(RegisterHashEltCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new CmdHashElt();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(CmdHashElt);
 }

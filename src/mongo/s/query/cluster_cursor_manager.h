@@ -39,6 +39,7 @@
 #include "mongo/db/session_killer.h"
 #include "mongo/platform/random.h"
 #include "mongo/s/query/cluster_client_cursor.h"
+#include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -190,6 +191,16 @@ public:
         void returnCursor(CursorState cursorState);
 
         /**
+         * Returns the command object which originally created this cursor.
+         */
+        BSONObj getOriginatingCommand() const;
+
+        /**
+         * Returns a reference to the vector of remote hosts involved in this operation.
+         */
+        std::size_t getNumRemotes() const;
+
+        /**
          * Returns the cursor id for the underlying cursor, or zero if no cursor is owned.
          */
         CursorId getCursorId() const;
@@ -224,6 +235,26 @@ public:
          * if the cursor is not tailable + awaitData).
          */
         Status setAwaitDataTimeout(Milliseconds awaitDataTimeout);
+
+        /**
+         * Returns the logical session id of the command that created the underlying cursor.
+         */
+        boost::optional<LogicalSessionId> getLsid() const;
+
+        /**
+         * Returns the transaction number of the command that created the underlying cursor.
+         */
+        boost::optional<TxnNumber> getTxnNumber() const;
+
+        Microseconds getLeftoverMaxTimeMicros() const {
+            invariant(_cursor);
+            return _cursor->getLeftoverMaxTimeMicros();
+        }
+
+        void setLeftoverMaxTimeMicros(Microseconds leftoverMaxTimeMicros) {
+            invariant(_cursor);
+            _cursor->setLeftoverMaxTimeMicros(leftoverMaxTimeMicros);
+        }
 
     private:
         // ClusterCursorManager is a friend so that its methods can call the PinnedCursor
@@ -279,6 +310,9 @@ public:
      * operating on a sharded namespace (this will be used for reporting purposes).
      * 'cursorLifetime' should reflect whether or not this cursor should be immune from the idle
      * cursor destruction procedure.
+     *
+     * If the OperationContext has a deadline set (from a maxTimeMS), stashes the remaining time
+     * limit on 'cursor' for use in subsequent getMores.
      *
      * On an error return, kills 'cursor'.
      *

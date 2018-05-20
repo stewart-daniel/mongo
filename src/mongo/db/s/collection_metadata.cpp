@@ -42,26 +42,23 @@
 namespace mongo {
 
 CollectionMetadata::CollectionMetadata(std::shared_ptr<ChunkManager> cm, const ShardId& thisShardId)
-    : _cm(std::move(cm)),
-      _thisShardId(thisShardId),
-      _shardVersion(_cm->getVersion(thisShardId)),
-      _chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()) {
+    : _cm(std::move(cm)), _thisShardId(thisShardId) {
 
     invariant(_cm->getVersion().isSet());
-    invariant(_cm->getVersion() >= _shardVersion);
+    invariant(_cm->getVersion() >= getShardVersion());
+}
+
+RangeMap CollectionMetadata::getChunks() const {
+    RangeMap chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>());
 
     for (const auto& chunk : _cm->chunks()) {
-        if (chunk->getShardId() != _thisShardId)
+        if (chunk.getShardId() != _thisShardId)
             continue;
 
-        _chunksMap.emplace_hint(_chunksMap.end(), chunk->getMin(), chunk->getMax());
+        chunksMap.emplace_hint(chunksMap.end(), chunk.getMin(), chunk.getMax());
     }
 
-    if (_chunksMap.empty()) {
-        invariant(!_shardVersion.isSet());
-        return;
-    }
-    invariant(_shardVersion.isSet());
+    return chunksMap;
 }
 
 bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk) const {
@@ -70,18 +67,18 @@ bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk
         return false;
 
     const auto& nextChunk = *foundIt.begin();
-    chunk->setMin(nextChunk->getMin());
-    chunk->setMax(nextChunk->getMax());
+    chunk->setMin(nextChunk.getMin());
+    chunk->setMax(nextChunk.getMax());
     return true;
 }
 
 bool CollectionMetadata::getDifferentChunk(const BSONObj& chunkMinKey,
                                            ChunkType* differentChunk) const {
     for (const auto& found : _cm->chunks()) {
-        if (found->getShardId() == _thisShardId) {
-            if (found->getMin().woCompare(chunkMinKey) != 0) {
-                differentChunk->setMin(found->getMin());
-                differentChunk->setMax(found->getMax());
+        if (found.getShardId() == _thisShardId) {
+            if (found.getMin().woCompare(chunkMinKey) != 0) {
+                differentChunk->setMin(found.getMin());
+                differentChunk->setMax(found.getMax());
                 return true;
             }
         }
@@ -113,16 +110,16 @@ Status CollectionMetadata::checkChunkIsValid(const ChunkType& chunk) const {
 
 void CollectionMetadata::toBSONBasic(BSONObjBuilder& bb) const {
     _cm->getVersion().addToBSON(bb, "collVersion");
-    _shardVersion.addToBSON(bb, "shardVersion");
+    getShardVersion().addToBSON(bb, "shardVersion");
     bb.append("keyPattern", _cm->getShardKeyPattern().toBSON());
 }
 
 void CollectionMetadata::toBSONChunks(BSONArrayBuilder& bb) const {
     for (const auto& chunk : _cm->chunks()) {
-        if (chunk->getShardId() == _thisShardId) {
+        if (chunk.getShardId() == _thisShardId) {
             BSONArrayBuilder chunkBB(bb.subarrayStart());
-            chunkBB.append(chunk->getMin());
-            chunkBB.append(chunk->getMax());
+            chunkBB.append(chunk.getMin());
+            chunkBB.append(chunk.getMax());
             chunkBB.done();
         }
     }
@@ -130,13 +127,15 @@ void CollectionMetadata::toBSONChunks(BSONArrayBuilder& bb) const {
 
 std::string CollectionMetadata::toStringBasic() const {
     return str::stream() << "collection version: " << _cm->getVersion().toString()
-                         << ", shard version: " << _shardVersion.toString();
+                         << ", shard version: " << getShardVersion().toString();
 }
 
 boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(
     RangeMap const& receivingChunks, BSONObj const& origLookupKey) const {
     const BSONObj maxKey = getMaxKey();
     BSONObj lookupKey = origLookupKey;
+
+    auto chunksMap = getChunks();
 
     while (lookupKey.woCompare(maxKey) < 0) {
         using Its = std::pair<RangeMap::const_iterator, RangeMap::const_iterator>;
@@ -165,7 +164,7 @@ boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(
         };
 
         boost::optional<Its> chunksIts, pendingIts;
-        if (!(chunksIts = patchLookupKey(_chunksMap)) ||
+        if (!(chunksIts = patchLookupKey(chunksMap)) ||
             !(pendingIts = patchLookupKey(receivingChunks))) {
             continue;
         }
@@ -189,7 +188,7 @@ boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(
             }
         };
 
-        patchArgRange(_chunksMap, *chunksIts);
+        patchArgRange(chunksMap, *chunksIts);
         patchArgRange(receivingChunks, *pendingIts);
 
         return ChunkRange(rangeMin.getOwned(), rangeMax.getOwned());

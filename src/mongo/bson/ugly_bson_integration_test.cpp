@@ -32,18 +32,18 @@
 #include <exception>
 
 #include "mongo/client/connection_string.h"
-#include "mongo/executor/network_interface_asio_integration_fixture.h"
+#include "mongo/executor/network_interface_integration_fixture.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/net/op_msg.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace executor {
 namespace {
 
-class UglyBSONFixture : public NetworkInterfaceASIOIntegrationFixture {
+class UglyBSONFixture : public NetworkInterfaceIntegrationFixture {
     void setUp() override {
         startNet();
     }

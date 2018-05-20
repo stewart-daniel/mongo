@@ -41,6 +41,10 @@ class ReIndexCmd : public ErrmsgCommandDeprecated {
 public:
     ReIndexCmd() : ErrmsgCommandDeprecated("reIndex") {}
 
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsCollectionRequired(dbname, cmdObj).ns();
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -66,12 +70,10 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
-        LOG(1) << "reIndex: " << nss << " cmd:" << redact(cmdObj);
+        const NamespaceString nss(parseNs(dbName, cmdObj));
 
         auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
             opCtx,
-            dbName,
             nss,
             CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
             ReadPreferenceSetting::get(opCtx),

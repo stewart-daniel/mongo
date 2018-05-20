@@ -101,7 +101,6 @@ bool IndexDescriptor::isIndexVersionSupported(IndexVersion indexVersion) {
         case IndexVersion::kV0:
         case IndexVersion::kV1:
         case IndexVersion::kV2:
-        case IndexVersion::kV2Unique:
             return true;
     }
     return false;
@@ -120,7 +119,6 @@ Status IndexDescriptor::isIndexVersionAllowedForCreation(
             break;
         case IndexVersion::kV1:
         case IndexVersion::kV2:
-        case IndexVersion::kV2Unique:
             return Status::OK();
     }
     return {ErrorCodes::CannotCreateIndex,
@@ -129,13 +127,7 @@ Status IndexDescriptor::isIndexVersionAllowedForCreation(
                           << static_cast<int>(indexVersion)};
 }
 
-IndexVersion IndexDescriptor::getDefaultIndexVersion(
-    ServerGlobalParams::FeatureCompatibility::Version featureCompatibilityVersion) {
-    // The gating variable would allow creation of V2 format unique index when set to true.
-    const bool useV2UniqueIndexFormat = false;
-    if (useV2UniqueIndexFormat)
-        return IndexVersion::kV2Unique;
-
+IndexVersion IndexDescriptor::getDefaultIndexVersion() {
     return IndexVersion::kV2;
 }
 

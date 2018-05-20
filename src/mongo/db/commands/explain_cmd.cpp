@@ -31,13 +31,9 @@
 #include "mongo/db/command_can_run_here.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
 /**
@@ -52,13 +48,12 @@ namespace {
  * This command like a dispatcher: it just retrieves a pointer to the nested command and invokes
  * its explain() implementation.
  */
-class CmdExplain : public BasicCommand {
+class CmdExplain final : public Command {
 public:
-    CmdExplain() : BasicCommand("explain") {}
+    CmdExplain() : Command("explain") {}
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
+    std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
+                                             const OpMsgRequest& request) override;
 
     /**
      * Running an explain on a secondary requires explicitly setting slaveOk.
@@ -67,11 +62,11 @@ public:
         return AllowedOnSecondary::kOptIn;
     }
 
-    virtual bool maintenanceOk() const {
+    bool maintenanceOk() const override {
         return false;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return false;
     }
 
@@ -79,18 +74,50 @@ public:
         return "explain database reads and writes";
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        uassert(ErrorCodes::BadValue,
-                "explain command requires a nested object",
-                Object == cmdObj.firstElement().type());
-        auto explainObj = cmdObj.firstElement().Obj();
+private:
+    class Invocation;
+};
 
-        Command* commToExplain = CommandHelpers::findCommand(explainObj.firstElementFieldName());
-        uassert(ErrorCodes::CommandNotFound,
-                str::stream() << "explain failed due to unknown command: "
-                              << explainObj.firstElementFieldName(),
-                commToExplain);
-        return commToExplain->parseNs(dbname, explainObj);
+class CmdExplain::Invocation final : public CommandInvocation {
+public:
+    Invocation(const CmdExplain* explainCommand,
+               const OpMsgRequest& request,
+               ExplainOptions::Verbosity verbosity,
+               std::unique_ptr<OpMsgRequest> innerRequest,
+               std::unique_ptr<CommandInvocation> innerInvocation)
+        : CommandInvocation(explainCommand),
+          _outerRequest{&request},
+          _dbName{_outerRequest->getDatabase().toString()},
+          _verbosity{std::move(verbosity)},
+          _innerRequest{std::move(innerRequest)},
+          _innerInvocation{std::move(innerInvocation)} {}
+
+    void run(OperationContext* opCtx, CommandReplyBuilder* result) override {
+        uassert(50746,
+                "Explain's child command cannot run on this node. "
+                "Are you explaining a write command on a secondary?",
+                commandCanRunHere(opCtx, _dbName, _innerInvocation->definition()));
+        try {
+            BSONObjBuilder bob = result->getBodyBuilder();
+            _innerInvocation->explain(opCtx, _verbosity, &bob);
+        } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
+            CommandHelpers::logAuthViolation(opCtx, this, *_outerRequest, ErrorCodes::Unauthorized);
+            throw;
+        }
+    }
+
+    void explain(OperationContext* opCtx,
+                 ExplainOptions::Verbosity verbosity,
+                 BSONObjBuilder* result) override {
+        uasserted(ErrorCodes::IllegalOperation, "Explain cannot explain itself.");
+    }
+
+    NamespaceString ns() const override {
+        return _innerInvocation->ns();
+    }
+
+    bool supportsWriteConcern() const override {
+        return false;
     }
 
     /**
@@ -98,73 +125,53 @@ public:
      * the command that you are explaining. The auth check is performed recursively
      * on the nested command.
      */
-    virtual Status checkAuthForOperation(OperationContext* opCtx,
-                                         const std::string& dbname,
-                                         const BSONObj& cmdObj) const {
-        if (Object != cmdObj.firstElement().type()) {
-            return Status(ErrorCodes::BadValue, "explain command requires a nested object");
-        }
-
-        BSONObj explainObj = cmdObj.firstElement().Obj();
-
-        Command* commToExplain = CommandHelpers::findCommand(explainObj.firstElementFieldName());
-        if (NULL == commToExplain) {
-            mongoutils::str::stream ss;
-            ss << "unknown command: " << explainObj.firstElementFieldName();
-            return Status(ErrorCodes::CommandNotFound, ss);
-        }
-
-        return commToExplain->checkAuthForRequest(
-            opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(explainObj)));
+    void doCheckAuthorization(OperationContext* opCtx) const override {
+        _innerInvocation->checkAuthorization(opCtx, *_innerRequest);
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        auto verbosity = ExplainOptions::parseCmdBSON(cmdObj);
-        if (!verbosity.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, verbosity.getStatus());
-        }
-
-        // This is the nested command which we are explaining.
-        BSONObj explainObj = cmdObj.firstElement().Obj();
-
-        if (auto innerDb = explainObj["$db"]) {
-            uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Mismatched $db in explain command. Expected " << dbname
-                                  << " but got "
-                                  << innerDb.checkAndGetStringData(),
-                    innerDb.checkAndGetStringData() == dbname);
-        }
-
-        Command* commToExplain = CommandHelpers::findCommand(explainObj.firstElementFieldName());
-        if (NULL == commToExplain) {
-            mongoutils::str::stream ss;
-            ss << "Explain failed due to unknown command: " << explainObj.firstElementFieldName();
-            Status explainStatus(ErrorCodes::CommandNotFound, ss);
-            return CommandHelpers::appendCommandStatus(result, explainStatus);
-        }
-
-        if (!commandCanRunHere(opCtx, dbname, commToExplain)) {
-            mongoutils::str::stream ss;
-            ss << "Explain's child command cannot run on this node. "
-               << "Are you explaining a write command on a secondary?";
-            CommandHelpers::appendCommandStatus(result, false, ss);
-            return false;
-        }
-
-        // Actually call the nested command's explain(...) method.
-        Status explainStatus =
-            commToExplain->explain(opCtx, dbname, explainObj, verbosity.getValue(), &result);
-        if (!explainStatus.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, explainStatus);
-        }
-
-        return true;
+private:
+    const CmdExplain* command() const {
+        return static_cast<const CmdExplain*>(definition());
     }
 
-} cmdExplain;
+    const OpMsgRequest* _outerRequest;
+    const std::string _dbName;
+    const NamespaceString _ns;
+    ExplainOptions::Verbosity _verbosity;
+    std::unique_ptr<OpMsgRequest> _innerRequest;  // Lifespan must enclose that of _innerInvocation.
+    std::unique_ptr<CommandInvocation> _innerInvocation;
+};
+
+std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
+                                                     const OpMsgRequest& request) {
+    CommandHelpers::uassertNoDocumentSequences(getName(), request);
+    std::string dbname = request.getDatabase().toString();
+    const BSONObj& cmdObj = request.body;
+    ExplainOptions::Verbosity verbosity = uassertStatusOK(ExplainOptions::parseCmdBSON(cmdObj));
+    uassert(ErrorCodes::BadValue,
+            "explain command requires a nested object",
+            cmdObj.firstElement().type() == Object);
+    auto explainedObj = cmdObj.firstElement().Obj();
+    if (auto innerDb = explainedObj["$db"]) {
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Mismatched $db in explain command. Expected " << dbname
+                              << " but got "
+                              << innerDb.checkAndGetStringData(),
+                innerDb.checkAndGetStringData() == dbname);
+    }
+    auto explainedCommand = CommandHelpers::findCommand(explainedObj.firstElementFieldName());
+    uassert(ErrorCodes::CommandNotFound,
+            str::stream() << "Explain failed due to unknown command: "
+                          << explainedObj.firstElementFieldName(),
+            explainedCommand);
+    auto innerRequest =
+        stdx::make_unique<OpMsgRequest>(OpMsgRequest::fromDBAndBody(dbname, explainedObj));
+    auto innerInvocation = explainedCommand->parse(opCtx, *innerRequest);
+    return stdx::make_unique<Invocation>(
+        this, request, std::move(verbosity), std::move(innerRequest), std::move(innerInvocation));
+}
+
+CmdExplain cmdExplain;
 
 }  // namespace
 }  // namespace mongo

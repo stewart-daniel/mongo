@@ -54,10 +54,11 @@ namespace mongo {
 
 void DurableViewCatalog::onExternalChange(OperationContext* opCtx, const NamespaceString& name) {
     dassert(opCtx->lockState()->isDbLockedForMode(name.db(), MODE_IX));
-    Database* db = dbHolder().get(opCtx, name.db());
+    Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, name.db());
 
     if (db) {
-        opCtx->recoveryUnit()->onCommit([db]() { db->getViewCatalog()->invalidate(); });
+        opCtx->recoveryUnit()->onCommit(
+            [db](boost::optional<Timestamp>) { db->getViewCatalog()->invalidate(); });
     }
 }
 
@@ -82,7 +83,7 @@ Status DurableViewCatalogImpl::iterate(OperationContext* opCtx, Callback callbac
         // Check the document is valid BSON, with only the expected fields.
         // Use the latest BSON validation version. Existing view definitions are allowed to contain
         // decimal data even if decimal is disabled.
-        fassertStatusOK(40224, validateBSON(data.data(), data.size(), BSONVersion::kLatest));
+        fassert(40224, validateBSON(data.data(), data.size(), BSONVersion::kLatest));
         BSONObj viewDef = data.toBson();
 
         // Check read definitions for correct structure, and refuse reading past invalid

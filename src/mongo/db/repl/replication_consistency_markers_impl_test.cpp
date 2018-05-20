@@ -97,26 +97,6 @@ BSONObj getOplogTruncateAfterPointDocument(OperationContext* opCtx,
         });
 }
 
-/**
- * Returns checkpoint timestamp document.
- */
-BSONObj getCheckpointTimestampDocument(OperationContext* opCtx,
-                                       const NamespaceString& checkpointTimestampNss) {
-    return writeConflictRetry(
-        opCtx,
-        "getCheckpointTimestampDocument",
-        checkpointTimestampNss.ns(),
-        [opCtx, checkpointTimestampNss] {
-            Lock::DBLock dblk(opCtx, checkpointTimestampNss.db(), MODE_IS);
-            Lock::CollectionLock lk(opCtx->lockState(), checkpointTimestampNss.ns(), MODE_IS);
-            BSONObj mv;
-            if (Helpers::getSingleton(opCtx, checkpointTimestampNss.ns().c_str(), mv)) {
-                return mv;
-            }
-            return mv;
-        });
-}
-
 class ReplicationConsistencyMarkersTest : public ServiceContextMongoDTest {
 protected:
     OperationContext* getOperationContext() {
@@ -167,10 +147,9 @@ bool RecoveryUnitWithDurabilityTracking::waitUntilDurable() {
 TEST_F(ReplicationConsistencyMarkersTest, InitialSyncFlag) {
     auto minValidNss = makeNamespace(_agent, "minValid");
     auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-    auto checkpointTimestampNss = makeNamespace(_agent, "checkpointTimestamp");
 
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss, checkpointTimestampNss);
+        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
     auto opCtx = getOperationContext();
     ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
@@ -195,10 +174,9 @@ TEST_F(ReplicationConsistencyMarkersTest, InitialSyncFlag) {
 TEST_F(ReplicationConsistencyMarkersTest, GetMinValidAfterSettingInitialSyncFlagWorks) {
     auto minValidNss = makeNamespace(_agent, "minValid");
     auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-    auto checkpointTimestampNss = makeNamespace(_agent, "checkpointTimestamp");
 
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss, checkpointTimestampNss);
+        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
     auto opCtx = getOperationContext();
     ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
@@ -218,10 +196,9 @@ TEST_F(ReplicationConsistencyMarkersTest, GetMinValidAfterSettingInitialSyncFlag
 TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     auto minValidNss = makeNamespace(_agent, "minValid");
     auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-    auto checkpointTimestampNss = makeNamespace(_agent, "checkpointTimestamp");
 
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss, checkpointTimestampNss);
+        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
     auto opCtx = getOperationContext();
     ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
@@ -230,7 +207,6 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     ASSERT(consistencyMarkers.getMinValid(opCtx).isNull());
     ASSERT(consistencyMarkers.getAppliedThrough(opCtx).isNull());
     ASSERT(consistencyMarkers.getOplogTruncateAfterPoint(opCtx).isNull());
-    ASSERT(consistencyMarkers.getCheckpointTimestamp(opCtx).isNull());
 
     // Setting min valid boundaries should affect getMinValid() result.
     OpTime startOpTime({Seconds(123), 0}, 1LL);
@@ -238,12 +214,10 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     consistencyMarkers.setAppliedThrough(opCtx, startOpTime);
     consistencyMarkers.setMinValid(opCtx, endOpTime);
     consistencyMarkers.setOplogTruncateAfterPoint(opCtx, endOpTime.getTimestamp());
-    consistencyMarkers.writeCheckpointTimestamp(opCtx, endOpTime.getTimestamp());
 
     ASSERT_EQ(consistencyMarkers.getAppliedThrough(opCtx), startOpTime);
     ASSERT_EQ(consistencyMarkers.getMinValid(opCtx), endOpTime);
     ASSERT_EQ(consistencyMarkers.getOplogTruncateAfterPoint(opCtx), endOpTime.getTimestamp());
-    ASSERT_EQ(consistencyMarkers.getCheckpointTimestamp(opCtx), endOpTime.getTimestamp());
 
     // setMinValid always changes minValid, but setMinValidToAtLeast only does if higher.
     consistencyMarkers.setMinValid(opCtx, startOpTime);  // Forcibly lower it.
@@ -270,17 +244,9 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
                       [OplogTruncateAfterPointDocument::kOplogTruncateAfterPointFieldName]
                           .timestamp());
 
-    // Check checkpoint timestamp document.
-    auto checkpointTimestampDocument =
-        getCheckpointTimestampDocument(opCtx, checkpointTimestampNss);
-    ASSERT_EQUALS(
-        endOpTime.getTimestamp(),
-        checkpointTimestampDocument[CheckpointTimestampDocument::kCheckpointTimestampFieldName]
-            .timestamp());
-
     // Recovery unit will be owned by "opCtx".
     RecoveryUnitWithDurabilityTracking* recoveryUnit = new RecoveryUnitWithDurabilityTracking();
-    opCtx->setRecoveryUnit(recoveryUnit, OperationContext::kNotInUnitOfWork);
+    opCtx->setRecoveryUnit(recoveryUnit, WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
     // Set min valid without waiting for the changes to be durable.
     OpTime endOpTime2({Seconds(789), 0}, 1LL);
@@ -291,53 +257,4 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     ASSERT_FALSE(recoveryUnit->waitUntilDurableCalled);
 }
 
-TEST_F(ReplicationConsistencyMarkersTest, SetMinValidOnPVChange) {
-    auto minValidNss = makeNamespace(_agent, "minValid");
-    auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-    auto checkpointTimestampNss = makeNamespace(_agent, "checkpointTimestamp");
-
-    ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss, checkpointTimestampNss);
-    auto opCtx = getOperationContext();
-    ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
-    consistencyMarkers.initializeMinValidDocument(opCtx);
-
-    auto advanceAndCheckMinValidOpTime = [&](OpTime advanceTo, OpTime expected) {
-        consistencyMarkers.setMinValidToAtLeast(opCtx, advanceTo);
-        ASSERT_EQUALS(expected, consistencyMarkers.getMinValid(opCtx));
-    };
-
-    // Set minValid in PV 1.
-    OpTime startOpTime({Seconds(20), 0}, 1LL);
-    advanceAndCheckMinValidOpTime(startOpTime, startOpTime);
-
-    // In rollback, minValid is when the date becomes consistent and never goes back.
-    OpTime rollbackOpTime({Seconds(10), 0}, 1LL);
-    advanceAndCheckMinValidOpTime(rollbackOpTime, startOpTime);
-
-    // Writes arrive, so minValid advances.
-    OpTime opTime1({Seconds(30), 0}, 1LL);
-    advanceAndCheckMinValidOpTime(opTime1, opTime1);
-
-    // A new term starts and oplog diverges, so the timestamp is lower.
-    OpTime newTermOpTime({Seconds(20), 0}, 2LL);
-    advanceAndCheckMinValidOpTime(newTermOpTime, newTermOpTime);
-
-    // We should never advance minValid to a lower term, but verify it never goes back even if the
-    // timestamp is higher.
-    OpTime invalidOpTime({Seconds(80), 0}, 1LL);
-    advanceAndCheckMinValidOpTime(invalidOpTime, newTermOpTime);
-
-    // PV downgrade to PV0
-    OpTime downgradeOpTime({Seconds(50), 0}, -1LL);
-    advanceAndCheckMinValidOpTime(downgradeOpTime, downgradeOpTime);
-
-    // Writes arrive in PV0.
-    OpTime opTime2({Seconds(60), 0}, -1LL);
-    advanceAndCheckMinValidOpTime(opTime2, opTime2);
-
-    // PV upgrade again.
-    OpTime upgradeOpTime({Seconds(70), 0}, 0LL);
-    advanceAndCheckMinValidOpTime(upgradeOpTime, upgradeOpTime);
-}
 }  // namespace

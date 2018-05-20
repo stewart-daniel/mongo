@@ -30,10 +30,12 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/s/sharding_migration_critical_section.h"
 #include "mongo/s/database_version_gen.h"
 
 namespace mongo {
 
+class MovePrimarySourceManager;
 class OperationContext;
 
 /**
@@ -45,29 +47,28 @@ class DatabaseShardingState {
 public:
     static const Database::Decoration<DatabaseShardingState> get;
 
-    DatabaseShardingState(Database* db);
+    DatabaseShardingState();
     ~DatabaseShardingState() = default;
 
     /**
-     * Assigns a new Notification to _critSecSignal and invalidates all yielded readers and writers
-     * on collections in Database that have a client dbVersion on their OperationContext.
-     *
-     * Invariants that _critSecSignal was null and that the caller holds the DBLock in X mode.
+     * Methods to control the databases's critical section. Must be called with the database X lock
+     * held.
      */
-    void enterCriticalSection(OperationContext* opCtx);
-
-    /**
-     * Signals and clears _critSecSignal, and sets _dbVersion to 'newDbVersion'.
-     *
-     * Invariants that _critSecSignal was not null and that the caller holds the DBLock in X mode.
-     */
+    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx);
+    void enterCriticalSectionCommitPhase(OperationContext* opCtx);
     void exitCriticalSection(OperationContext* opCtx,
                              boost::optional<DatabaseVersion> newDbVersion);
 
+    auto getCriticalSectionSignal(ShardingMigrationCriticalSection::Operation op) const {
+        return _critSec.getSignal(op);
+    }
+
     /**
-     * Returns a shared_ptr to _critSecSignal if it's non-null, otherwise nullptr.
+     * Returns this shard server's cached dbVersion, if one is cached.
+     *
+     * Invariants that the caller holds the DBLock in X or IS.
      */
-    std::shared_ptr<Notification<void>> getCriticalSectionSignal() const;
+    boost::optional<DatabaseVersion> getDbVersion(OperationContext* opCtx) const;
 
     /**
      * Sets this shard server's cached dbVersion to newVersion.
@@ -83,21 +84,42 @@ public:
      */
     void checkDbVersion(OperationContext* opCtx) const;
 
-private:
-    // The database to which this sharding state corresponds.
-    const Database* _db;
+    /**
+     * Returns the active movePrimary source manager, if one is available.
+     */
+    MovePrimarySourceManager* getMovePrimarySourceManager();
 
+    /**
+     * Attaches a movePrimary source manager to this database's sharding state. Must be called with
+     * the database lock in X mode. May not be called if there is a movePrimary source manager
+     * already installed. Must be followed by a call to clearMovePrimarySourceManager.
+     */
+    void setMovePrimarySourceManager(OperationContext* opCtx, MovePrimarySourceManager* sourceMgr);
+
+    /**
+     * Removes a movePrimary source manager from this database's sharding state. Must be called with
+     * with the database lock in X mode. May not be called if there isn't a movePrimary source
+     * manager installed already through a previous call to setMovePrimarySourceManager.
+     */
+    void clearMovePrimarySourceManager(OperationContext* opCtx);
+
+private:
     // Modifying the state below requires holding the DBLock in X mode; holding the DBLock in any
     // mode is acceptable for reading it. (Note: accessing this class at all requires holding the
     // DBLock in some mode, since it requires having a pointer to the Database).
 
-    // Is non-null if this shard server is in a movePrimary critical section for the database.
-    // Stored as shared_ptr rather than boost::optional so callers can wait on it outside a DBLock.
-    std::shared_ptr<Notification<void>> _critSecSignal;
+    ShardingMigrationCriticalSection _critSec;
 
     // This shard server's cached dbVersion. If boost::none, indicates this shard server does not
     // know the dbVersion.
     boost::optional<DatabaseVersion> _dbVersion = boost::none;
+
+    // If this database is serving as a source shard for a movePrimary, the source manager will be
+    // non-null. To write this value, there needs to be X-lock on the database in order to
+    // synchronize with other callers which will read the source manager.
+    //
+    // NOTE: The source manager is not owned by this class.
+    MovePrimarySourceManager* _sourceMgr{nullptr};
 };
 
 }  // namespace mongo

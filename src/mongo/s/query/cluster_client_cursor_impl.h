@@ -103,6 +103,10 @@ public:
 
     bool isTailableAndAwaitData() const final;
 
+    BSONObj getOriginatingCommand() const final;
+
+    std::size_t getNumRemotes() const final;
+
     long long getNumReturnedSoFar() const final;
 
     void queueResult(const ClusterQueryResult& result) final;
@@ -112,6 +116,8 @@ public:
     Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) final;
 
     boost::optional<LogicalSessionId> getLsid() const final;
+
+    boost::optional<TxnNumber> getTxnNumber() const final;
 
     boost::optional<ReadPreferenceSetting> getReadPreference() const final;
 

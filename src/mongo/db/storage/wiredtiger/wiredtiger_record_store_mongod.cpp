@@ -72,7 +72,7 @@ public:
      * Returns true iff there was an oplog to delete from.
      */
     bool _deleteExcessDocuments() {
-        if (!getGlobalServiceContext()->getGlobalStorageEngine()) {
+        if (!getGlobalServiceContext()->getStorageEngine()) {
             LOG(2) << "no global storage engine yet";
             return false;
         }
@@ -103,6 +103,8 @@ public:
                 return false;  // Oplog went away.
             }
             rs->reclaimOplog(&opCtx);
+        } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
+            return false;
         } catch (const std::exception& e) {
             severe() << "error in WiredTigerRecordStoreThread: " << e.what();
             fassertFailedNoTrace(!"error in WiredTigerRecordStoreThread");

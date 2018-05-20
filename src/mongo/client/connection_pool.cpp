@@ -105,7 +105,7 @@ void ConnectionPool::closeAllInUseConnections() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     for (ConnectionList::iterator iter = _inUseConnections.begin(); iter != _inUseConnections.end();
          ++iter) {
-        iter->conn->port().shutdown();
+        iter->conn->shutdown();
     }
 }
 
@@ -177,7 +177,7 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
             0,      // socket timeout
             {},     // MongoURI
             [this, target](const executor::RemoteCommandResponse& isMasterReply) {
-                return _hook->validateHost(target, isMasterReply);
+                return _hook->validateHost(target, BSONObj(), isMasterReply);
             }));
     } else {
         conn.reset(new DBClientConnection());
@@ -189,7 +189,7 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
     conn->setSoTimeout(durationCount<Milliseconds>(timeout) / 1000.0);
 
     uassertStatusOK(conn->connect(target, StringData()));
-    conn->port().setTag(conn->port().getTag() | _messagingPortTags);
+    conn->setTags(_messagingPortTags);
 
     if (isInternalAuthSet()) {
         conn->auth(getInternalUserAuthParams());

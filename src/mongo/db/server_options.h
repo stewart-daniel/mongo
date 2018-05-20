@@ -146,8 +146,9 @@ struct ServerGlobalParams {
 
     struct FeatureCompatibility {
         /**
-         * The combination of the fields in the admin.system.version document in the format
-         * (version, targetVersion) are represented by this enum and determine this node's behavior.
+         * The combination of the fields (version, targetVersion) in the featureCompatiiblityVersion
+         * document in the server configuration collection (admin.system.version) are represented by
+         * this enum and determine this node's behavior.
          *
          * Features can be gated for specific versions, or ranges of versions above or below some
          * minimum or maximum version, respectively.
@@ -199,10 +200,21 @@ struct ServerGlobalParams {
         }
 
         /**
-         * This safe getter for the featureCompatibilityVersion returns a default value when the
-         * version has not yet been set.
+         * This safe getter for the featureCompatibilityVersion parameter ensures the parameter has
+         * been initialized with a meaningful value.
          */
         const Version getVersion() const {
+            invariant(isVersionInitialized());
+            return _version.load();
+        }
+
+        /**
+         * This unsafe getter for the featureCompatibilityVersion parameter returns the last-stable
+         * featureCompatibilityVersion value if the parameter has not yet been initialized with a
+         * meaningful value. This getter should only be used if the parameter is intentionally read
+         * prior to the creation/parsing of the featureCompatibilityVersion document.
+         */
+        const Version getVersionUnsafe() const {
             Version v = _version.load();
             return (v == Version::kUnsetDefault36Behavior) ? Version::kFullyDowngradedTo36 : v;
         }
@@ -225,11 +237,10 @@ struct ServerGlobalParams {
 
     } featureCompatibility;
 
-    // Feature validation differs depending on the role of a mongod in a replica set or
-    // master/slave configuration. Masters/primaries can accept user-initiated writes and
-    // validate based on the feature compatibility version. A secondary/slave (which is not also
-    // a master) always validates in the upgraded mode so that it can sync new features, even
-    // when in the downgraded feature compatibility mode.
+    // Feature validation differs depending on the role of a mongod in a replica set. Replica set
+    // primaries can accept user-initiated writes and validate based on the feature compatibility
+    // version. A secondary always validates in the upgraded mode so that it can sync new features,
+    // even when in the downgraded feature compatibility mode.
     AtomicWord<bool> validateFeaturesAsMaster{true};
 
     std::vector<std::string> disabledSecureAllocatorDomains;

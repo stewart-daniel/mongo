@@ -104,7 +104,7 @@ class Document;
 
 #define REGISTER_TEST_DOCUMENT_SOURCE(key, liteParser, fullParser) \
     REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                        \
-        key, liteParser, fullParser, Command::testCommandsEnabled)
+        key, liteParser, fullParser, ::mongo::getTestCommandsEnabled())
 
 /**
  * Registers a multi-stage alias (such as $sortByCount) to have the single name 'key'. When a stage
@@ -187,18 +187,26 @@ public:
          */
         enum class FacetRequirement { kAllowed, kNotAllowed };
 
+        /**
+         * Indicates whether or not this stage is legal when the read concern for the aggregate has
+         * readConcern level "snapshot" or is running inside of a multi-document transaction.
+         */
+        enum class TransactionRequirement { kNotAllowed, kAllowed };
+
         StageConstraints(
             StreamType streamType,
             PositionRequirement requiredPosition,
             HostTypeRequirement hostRequirement,
             DiskUseRequirement diskRequirement,
             FacetRequirement facetRequirement,
+            TransactionRequirement transactionRequirement,
             ChangeStreamRequirement changeStreamRequirement = ChangeStreamRequirement::kBlacklist)
             : requiredPosition(requiredPosition),
               hostRequirement(hostRequirement),
               diskRequirement(diskRequirement),
               changeStreamRequirement(changeStreamRequirement),
               facetRequirement(facetRequirement),
+              transactionRequirement(transactionRequirement),
               streamType(streamType) {
             // Stages which are allowed to run in $facet must not have any position requirements.
             invariant(
@@ -219,6 +227,18 @@ public:
             // A stage which is whitelisted for $changeStream cannot have a position requirement.
             invariant(!(changeStreamRequirement == ChangeStreamRequirement::kWhitelist &&
                         requiredPosition != PositionRequirement::kNone));
+
+            // Change stream stages should not be permitted with readConcern level "snapshot" or
+            // inside of a multi-document transaction.
+            if (isChangeStreamStage()) {
+                invariant(!isAllowedInTransaction());
+            }
+
+            // Stages which write data to user collections should not be permitted with readConcern
+            // level "snapshot" or inside of a multi-document transaction.
+            if (diskRequirement == DiskUseRequirement::kWritesPersistentData) {
+                invariant(!isAllowedInTransaction());
+            }
         }
 
         /**
@@ -262,6 +282,14 @@ public:
             return changeStreamRequirement == ChangeStreamRequirement::kChangeStreamStage;
         }
 
+        /**
+         * Returns true if this stage is legal when the readConcern level is "snapshot" or when this
+         * aggregation is being run within a multi-document transaction.
+         */
+        bool isAllowedInTransaction() const {
+            return transactionRequirement == TransactionRequirement::kAllowed;
+        }
+
         // Indicates whether this stage needs to be at a particular position in the pipeline.
         const PositionRequirement requiredPosition;
 
@@ -279,6 +307,10 @@ public:
 
         // Indicates whether this stage may run inside a $facet stage.
         const FacetRequirement facetRequirement;
+
+        // Indicates whether this stage is legal when the readConcern level is "snapshot" or the
+        // aggregate is running inside of a multi-document transaction.
+        const TransactionRequirement transactionRequirement;
 
         // Indicates whether this is a streaming or blocking stage.
         const StreamType streamType;
@@ -309,6 +341,7 @@ public:
     using DiskUseRequirement = StageConstraints::DiskUseRequirement;
     using FacetRequirement = StageConstraints::FacetRequirement;
     using StreamType = StageConstraints::StreamType;
+    using TransactionRequirement = StageConstraints::TransactionRequirement;
 
     /**
      * This is what is returned from the main DocumentSource API: getNext(). It is essentially a
@@ -673,7 +706,7 @@ private:
  * This class marks DocumentSources that should be split between the merger and the shards. See
  * Pipeline::Optimizations::Sharded::findSplitPoint() for details.
  */
-class SplittableDocumentSource {
+class NeedsMergerDocumentSource {
 public:
     /**
      * Returns a source to be run on the shards, or NULL if no work should be done on the shards for
@@ -686,17 +719,16 @@ public:
     virtual boost::intrusive_ptr<DocumentSource> getShardSource() = 0;
 
     /**
-     * Returns a list of stages that combine results from the shards, or an empty list if no work
-     * should be done in the merge pipeline for this stage. Must not mutate the existing source
-     * object; if different behaviour is required, a new source should be created and configured
-     * appropriately. It is an error for getMergeSources() to return a pointer to the same object as
-     * getShardSource().
+     * Returns a list of stages that combine results from the shards. Subclasses of this class
+     * should not return an empty list. Must not mutate the existing source object; if different
+     * behaviour is required, a new source should be created and configured appropriately. It is an
+     * error for getMergeSources() to return a pointer to the same object as getShardSource().
      */
     virtual std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() = 0;
 
 protected:
-    // It is invalid to delete through a SplittableDocumentSource-typed pointer.
-    virtual ~SplittableDocumentSource() {}
+    // It is invalid to delete through a NeedsMergerDocumentSource-typed pointer.
+    virtual ~NeedsMergerDocumentSource() {}
 };
 
 }  // namespace mongo
